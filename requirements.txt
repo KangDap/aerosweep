@@ -1,0 +1,13 @@
+# Add dependencies here
+# torch
+# torchvision
+# opencv-python
+# numpy
+# pandas
+# scikit-learn
+# scikit-fuzzy
+# deap
+# fastapi
+# uvicorn
+# streamlit
+# gradio

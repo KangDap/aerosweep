@@ -1,0 +1,6 @@
+# Fuzzy + GA config (placeholder)
+fitness:
+  metric: "f1"
+ga:
+  population_size: 50
+  generations: 40

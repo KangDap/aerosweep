@@ -1,0 +1,7 @@
+# CV training config (placeholder)
+model:
+  name: "your_model"
+train:
+  epochs: 50
+  batch_size: 8
+  image_size: 512
