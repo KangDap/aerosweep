@@ -1,0 +1,147 @@
+# =============================================================================
+# AeroSweep — .gitignore
+# =============================================================================
+
+
+# Dataset mentah (gambar + JSON anotasi) — ukuran besar, unduh dari Zenodo
+data/vision/raw/images/
+data/vision/raw/*.json
+data/vision/raw/*.zip
+data/vision/raw/*.tar.gz
+
+# Dataset hasil proses (generate ulang dengan dataset.py)
+data/vision/processed/images/
+data/vision/processed/labels/
+data/vision/processed/dataset.yaml
+
+# Hasil grid CSV (generate ulang dengan dataset.py)
+data/tabular/grid_results.csv
+
+# Tetap track folder struktur via .gitkeep
+!data/vision/raw/.gitkeep
+!data/vision/processed/.gitkeep
+!data/tabular/.gitkeep
+
+
+# -----------------------------------------------------------------------------
+# MODEL WEIGHTS — File sangat besar
+# -----------------------------------------------------------------------------
+
+# YOLO pretrained weights (download otomatis oleh Ultralytics)
+*.pt
+*.pth
+*.onnx
+*.engine
+*.tflite
+
+# Hasil training runs (log, grafik, weights)
+models/nn_weights/runs/
+models/nn_weights/*.pt
+
+# Fuzzy params hasil training
+models/fuzzy_params/*.pkl
+models/fuzzy_params/*.json
+
+# Tetap track folder
+!models/nn_weights/.gitkeep
+!models/fuzzy_params/.gitkeep
+
+
+# -----------------------------------------------------------------------------
+# PYTHON
+# -----------------------------------------------------------------------------
+
+# Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# Virtual environment
+.venv/
+venv/
+env/
+ENV/
+.env
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+*.egg
+.eggs/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+*.cover
+
+# MyPy / type checking
+.mypy_cache/
+.dmypy.json
+
+
+# -----------------------------------------------------------------------------
+# JUPYTER NOTEBOOK
+# -----------------------------------------------------------------------------
+
+# Output cell tersimpan di notebook — boleh di-push jika ingin simpan hasil
+# Uncomment baris berikut jika ingin push notebook tanpa output:
+# notebooks/**/*.ipynb
+
+# Jupyter checkpoint
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/
+
+
+# -----------------------------------------------------------------------------
+# IDE & EDITOR
+# -----------------------------------------------------------------------------
+
+# VSCode
+.vscode/
+*.code-workspace
+
+# PyCharm / JetBrains
+.idea/
+
+# Vim / Emacs
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+
+# -----------------------------------------------------------------------------
+# LOG & TEMP
+# -----------------------------------------------------------------------------
+
+*.log
+*.tmp
+*.temp
+logs/
+tmp/
+
+# Ultralytics cache
+datasets/
+runs/
+
+
+# -----------------------------------------------------------------------------
+# ENVIRONMENT VARIABLES
+# -----------------------------------------------------------------------------
+
+.env
+.env.local
+.env.*
+!.env.example
