@@ -1,648 +1,738 @@
-"""
-src/aerosweep/neuro/dataset.py
-================================
-Modul dataset untuk AeroSweep — menangani:
-  1. Parsing anotasi COCO (DroneWaste)
-  2. Class merging: 20 kelas → 5 superkategori
-  3. Konversi format COCO → YOLO (.txt per gambar)
-  4. K-Fold split untuk cross-validation
-  5. Grid mapping: agregasi deteksi per sel → output tabular untuk Fuzzy
-
-Struktur output:
-  data/vision/processed/
-    ├── images/train/   ← symlink atau copy gambar
-    ├── images/val/
-    ├── labels/train/   ← file .txt format YOLO
-    ├── labels/val/
-    └── dataset.yaml    ← config Ultralytics
-
-  data/tabular/
-    └── grid_results.csv  ← [image_id, grid_row, grid_col,
-                               jumlah_sampah, kepadatan_pct, superclass_counts]
-
-Penggunaan:
-  from src.aerosweep.neuro.dataset import DroneWasteDataset
-
-  ds = DroneWasteDataset(
-      coco_json="data/vision/raw/annotations.json",
-      images_dir="data/vision/raw/images",
-      output_dir="data/vision/processed",
-  )
-  ds.prepare(grid_size=(8, 8), n_folds=5, fold_idx=0)
-"""
-
-from __future__ import annotations
+# ==============================================================================
+# AeroSweep — Modul Dataset & Preprocessing
+# File: src/aerosweep/neuro/dataset.py
+# Tanggung jawab:
+#   1. Membaca citra UAV resolusi tinggi
+#   2. Membaca anotasi COCO JSON (dronewaste_v1.0.json)
+#   3. Overlapping sliding window → patch 512x512
+#   4. Konversi anotasi poligon COCO → format segmentasi YOLO (.txt)
+#   5. Auto-update configs/cv.yaml dengan nama kelas dari JSON
+# Dipanggil oleh: scripts/01_preprocessing.py
+# ==============================================================================
 
 import json
-import math
+import os
 import shutil
 import random
-from collections import defaultdict
+import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Optional
 
+import cv2
 import numpy as np
+import yaml
+from tqdm import tqdm
+from pycocotools import mask as coco_mask_utils
+from pycocotools.coco import COCO
 
-# ---------------------------------------------------------------------------
-# 1. SUPERCLASS MAPPING  (20 DroneWaste kelas → 5 superkategori)
-# ---------------------------------------------------------------------------
-# Kunci  : nama kategori asli di COCO JSON DroneWaste (lowercase, strip spasi)
-# Nilai  : (superclass_id, superclass_name)
-#
-# Catatan: nama kategori exak ada di annotations.json.  Kalau ada yang tidak
-#          cocok, method _build_category_map() akan mencetak peringatan
-#          sehingga mudah diperbaiki tanpa crash.
-
-SUPERCLASS_MAP: Dict[str, Tuple[int, str]] = {
-    # ── 0 : Plastik & Kemasan ─────────────────────────────────────────
-    # Semua material berbasis plastik dan kertas/kemasan ringan
-    "plastic packaging":                    (0, "plastic_packaging"),
-    "plastic":                              (0, "plastic_packaging"),   # id:13 — tumpukan plastik
-    "paper":                                (0, "plastic_packaging"),   # id:16 — kertas/karton
-
-    # ── 1 : Logam & Kaca ──────────────────────────────────────────────
-    # Limbah logam, besi tua, peralatan elektrikal berat
-    "metal barrels":                        (1, "metal_glass"),         # id:8
-    "scrap":                                (1, "metal_glass"),         # id:12 — besi tua
-    "appliances":                           (1, "metal_glass"),         # id:5 — peralatan rumah tangga besar
-    "foundry":                              (1, "metal_glass"),         # id:17 — abu/slag industri
-
-    # ── 2 : Konstruksi & Puing ────────────────────────────────────────
-    # Puing bangunan, tanah galian, material jalan
-    "construction and demolition materials":(2, "construction"),        # id:2
-    "asphalt milling":                      (2, "construction"),        # id:3
-    "excavation materials":                 (2, "construction"),        # id:4
-    "pallets":                              (2, "construction"),        # id:11 — palet kayu industri
-    "rubble":                               (2, "construction"),        # id:1 — tanah/bebatuan
-
-    # ── 3 : Berbahaya ─────────────────────────────────────────────────
-    # Limbah B3: kendaraan, ban, elektronik, asbes
-    "electronic equipment":                 (3, "hazardous"),           # id:6
-    "vehicles":                             (3, "hazardous"),           # id:14
-    "tyres":                                (3, "hazardous"),           # id:15
-    "asbestos":                             (3, "hazardous"),           # id:18 — sangat berbahaya
-
-    # ── 4 : Organik & Campuran ────────────────────────────────────────
-    # Furnitur, kayu non-industri, tekstil, campuran tak terklasifikasi
-    "furniture":                            (4, "organic_mixed"),       # id:7
-    "mixed items":                          (4, "organic_mixed"),       # id:20
-    "wood":                                 (4, "organic_mixed"),       # id:10 — limbah kayu
-    "textile":                              (4, "organic_mixed"),       # id:19 — limbah tekstil
-}
-
-NUM_SUPERCLASSES = 5
-SUPERCLASS_NAMES = [
-    "plastic_packaging",   # 0
-    "metal_glass",         # 1
-    "construction",        # 2
-    "hazardous",           # 3
-    "organic_mixed",       # 4
-]
+# ------------------------------------------------------------------------------
+# Setup Logger
+# ------------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("AeroSweep.dataset")
 
 
-# ---------------------------------------------------------------------------
-# 2. KELAS UTAMA
-# ---------------------------------------------------------------------------
+# ==============================================================================
+# KELAS UTAMA: DroneWasteDataset
+# ==============================================================================
 
 class DroneWasteDataset:
     """
-    Mengelola dataset DroneWaste dari raw COCO JSON hingga siap training YOLO
-    dan menghasilkan tabel grid untuk modul Fuzzy.
+    Kelas utama untuk memproses dataset DroneWaste.
 
-    Parameters
-    ----------
-    coco_json   : Path ke file annotations.json (format COCO)
-    images_dir  : Direktori berisi gambar-gambar (.jpg)
-    output_dir  : Root output → data/vision/processed/
-    seed        : Random seed untuk reproducibility
+    Alur kerja:
+        1. Inisialisasi → load COCO JSON + validasi
+        2. update_yaml()  → tulis nama kelas ke configs/cv.yaml
+        3. run()          → sliding window + konversi anotasi → simpan ke disk
+        4. split_dataset() → bagi hasil ke train/val
+
+    Contoh penggunaan:
+        ds = DroneWasteDataset(
+            coco_json_path="data/vision/raw/dronewaste_v1.0.json",
+            images_dir="data/vision/raw/images",
+            output_dir="data/vision/processed",
+            config_path="configs/cv.yaml",
+        )
+        ds.update_yaml()
+        ds.run()
+        ds.split_dataset()
     """
 
     def __init__(
         self,
-        coco_json: str | Path,
-        images_dir: str | Path,
-        output_dir: str | Path,
-        seed: int = 42,
-    ) -> None:
-        self.coco_json   = Path(coco_json)
-        self.images_dir  = Path(images_dir)
-        self.output_dir  = Path(output_dir)
-        self.seed        = seed
-
-        self._coco: dict            = {}
-        # cat_id (COCO) → (superclass_id, superclass_name)
-        self._cat_map: Dict[int, Tuple[int, str]] = {}
-        # image_id → list of annotations
-        self._ann_by_img: Dict[int, List[dict]] = defaultdict(list)
-        # image_id → image info dict
-        self._img_info: Dict[int, dict] = {}
-
-        self._loaded = False
-
-    # ------------------------------------------------------------------
-    # PUBLIC API
-    # ------------------------------------------------------------------
-
-    def prepare(
-        self,
-        grid_size: Tuple[int, int] = (8, 8),
-        n_folds: int = 5,
-        fold_idx: int = 0,
-        copy_images: bool = False,
-    ) -> Dict[str, Path]:
+        coco_json_path: str,
+        images_dir: str,
+        output_dir: str,
+        config_path: str,
+        patch_size: int = 512,
+        overlap: float = 0.2,
+        train_val_split: float = 0.8,
+        min_visibility: float = 0.1,
+        random_seed: int = 42,
+    ):
         """
-        Pipeline lengkap satu panggilan:
-          load → build_map → split → write_yolo → write_grid_csv
-
         Parameters
         ----------
-        grid_size   : (n_rows, n_cols) pembagian sel per gambar
-        n_folds     : jumlah fold untuk k-fold CV
-        fold_idx    : fold yang dipakai sebagai validasi (0-based)
-        copy_images : True = salin gambar; False = buat symlink (lebih cepat)
+        coco_json_path   : Path ke file dronewaste_v1.0.json
+        images_dir       : Path ke folder citra UAV asli
+        output_dir       : Path ke folder output patch + label
+        config_path      : Path ke configs/cv.yaml
+        patch_size       : Ukuran patch sliding window (piksel), default 512
+        overlap          : Fraksi overlap antar patch (0.0–1.0), default 0.2
+        train_val_split  : Rasio data training (0.0–1.0), default 0.8
+        min_visibility   : Minimum fraksi anotasi yang harus terlihat di patch
+        random_seed      : Seed untuk reproduktibilitas
+        """
+        self.coco_json_path  = Path(coco_json_path)
+        self.images_dir      = Path(images_dir)
+        self.output_dir      = Path(output_dir)
+        self.config_path     = Path(config_path)
+        self.patch_size      = patch_size
+        self.overlap         = overlap
+        self.train_val_split = train_val_split
+        self.min_visibility  = min_visibility
+        self.random_seed     = random_seed
+
+        # Seed global untuk reproduktibilitas
+        random.seed(self.random_seed)
+        np.random.seed(self.random_seed)
+
+        # Validasi path input
+        self._validate_paths()
+
+        # Load COCO JSON menggunakan pycocotools
+        logger.info(f"Memuat COCO JSON dari: {self.coco_json_path}")
+        self.coco = COCO(str(self.coco_json_path))
+
+        # Bangun mapping: coco_category_id → yolo_class_id (0-indexed)
+        # COCO ID tidak selalu mulai dari 0, YOLO wajib 0-indexed
+        self.coco_id_to_yolo_id, self.class_names = self._build_class_mapping()
+
+        logger.info(
+            f"Dataset dimuat: {len(self.coco.imgs)} citra, "
+            f"{len(self.coco.anns)} anotasi, "
+            f"{len(self.class_names)} kelas"
+        )
+
+        # Siapkan direktori output
+        self._prepare_output_dirs()
+
+        # Hitung stride sliding window dari patch_size dan overlap
+        # stride = jarak antar titik awal setiap patch
+        self.stride = int(self.patch_size * (1.0 - self.overlap))
+
+    # --------------------------------------------------------------------------
+    # PRIVATE: Validasi & Inisialisasi
+    # --------------------------------------------------------------------------
+
+    def _validate_paths(self):
+        """Validasi semua path wajib ada sebelum proses dimulai."""
+        if not self.coco_json_path.exists():
+            raise FileNotFoundError(
+                f"File COCO JSON tidak ditemukan: {self.coco_json_path}\n"
+                f"Pastikan dronewaste_v1.0.json ada di data/vision/raw/"
+            )
+        if not self.images_dir.exists():
+            raise FileNotFoundError(
+                f"Direktori citra tidak ditemukan: {self.images_dir}\n"
+                f"Pastikan citra UAV ada di data/vision/raw/images/"
+            )
+        if not self.config_path.exists():
+            raise FileNotFoundError(
+                f"File konfigurasi tidak ditemukan: {self.config_path}\n"
+                f"Pastikan configs/cv.yaml sudah dibuat."
+            )
+        logger.info("Validasi path: OK")
+
+    def _build_class_mapping(self) -> tuple[dict, dict]:
+        """
+        Bangun mapping dari COCO category_id ke YOLO class_id (0-indexed).
+
+        COCO tidak menjamin ID kelas mulai dari 0 atau berurutan.
+        YOLO mengharuskan class_id dimulai dari 0 dan berurutan.
 
         Returns
         -------
-        dict berisi path-path output penting
+        coco_id_to_yolo_id : dict {coco_id: yolo_id}
+        class_names        : dict {yolo_id: nama_kelas}
         """
-        self._load_coco()
-        self._build_category_map()
-        train_ids, val_ids = self._kfold_split(n_folds, fold_idx)
+        # Urutkan kategori berdasarkan COCO ID untuk konsistensi
+        categories = sorted(
+            self.coco.loadCats(self.coco.getCatIds()),
+            key=lambda x: x["id"]
+        )
 
-        yolo_dir = self._write_yolo_labels(train_ids, val_ids, copy_images)
-        yaml_path = self._write_dataset_yaml(yolo_dir)
-        grid_csv  = self._write_grid_csv(grid_size)
+        coco_id_to_yolo_id = {}
+        class_names = {}
 
-        print(f"\n{'='*55}")
-        print(f"  DroneWaste dataset siap")
-        print(f"  Train : {len(train_ids)} gambar")
-        print(f"  Val   : {len(val_ids)} gambar  (fold {fold_idx}/{n_folds})")
-        print(f"  YAML  : {yaml_path}")
-        print(f"  Grid  : {grid_csv}")
-        print(f"{'='*55}\n")
+        for yolo_id, cat in enumerate(categories):
+            coco_id_to_yolo_id[cat["id"]] = yolo_id
+            class_names[yolo_id] = cat["name"]
 
-        return {
-            "yolo_dir":  yolo_dir,
-            "yaml_path": yaml_path,
-            "grid_csv":  grid_csv,
-        }
+        logger.info(f"Mapping kelas dibangun: {len(class_names)} kelas")
+        for yolo_id, name in class_names.items():
+            logger.debug(f"  YOLO ID {yolo_id}: {name}")
 
-    def get_class_distribution(self) -> Dict[str, int]:
+        return coco_id_to_yolo_id, class_names
+
+    def _prepare_output_dirs(self):
+        """Buat direktori output jika belum ada."""
+        dirs = [
+            self.output_dir / "train" / "images",
+            self.output_dir / "train" / "labels",
+            self.output_dir / "val"   / "images",
+            self.output_dir / "val"   / "labels",
+        ]
+        for d in dirs:
+            d.mkdir(parents=True, exist_ok=True)
+        logger.info(f"Direktori output disiapkan di: {self.output_dir}")
+
+    # --------------------------------------------------------------------------
+    # PUBLIC: Update cv.yaml dengan nama kelas dari JSON
+    # --------------------------------------------------------------------------
+
+    def update_yaml(self):
         """
-        Menghitung jumlah instance per superkategori dari seluruh dataset.
-        Berguna untuk analisis class imbalance sebelum training.
+        Baca configs/cv.yaml, update bagian 'nc' dan 'names' dengan
+        data kelas yang dibaca langsung dari dronewaste_v1.0.json,
+        lalu tulis kembali ke disk.
+
+        Dipanggil SEBELUM run() agar cv.yaml siap saat training.
         """
-        if not self._loaded:
-            self._load_coco()
-            self._build_category_map()
+        logger.info(f"Memperbarui cv.yaml di: {self.config_path}")
 
-        counts: Dict[str, int] = defaultdict(int)
-        for anns in self._ann_by_img.values():
-            for ann in anns:
-                cid = ann["category_id"]
-                if cid in self._cat_map:
-                    _, sc_name = self._cat_map[cid]
-                    counts[sc_name] += 1
-        return dict(counts)
+        # Baca YAML yang ada
+        with open(self.config_path, "r", encoding="utf-8") as f:
+            config = yaml.safe_load(f)
 
-    def compute_grid_features(
+        # Update nc dan names
+        config["nc"]    = len(self.class_names)
+        config["names"] = self.class_names
+
+        # Tulis kembali ke disk dengan komentar header tetap terjaga
+        # Menggunakan allow_unicode=True agar nama kelas non-ASCII aman
+        with open(self.config_path, "w", encoding="utf-8") as f:
+            yaml.dump(
+                config,
+                f,
+                default_flow_style=False,
+                allow_unicode=True,
+                sort_keys=False,
+            )
+
+        logger.info(
+            f"cv.yaml diperbarui: nc={len(self.class_names)}, "
+            f"names={list(self.class_names.values())}"
+        )
+
+    # --------------------------------------------------------------------------
+    # PUBLIC: Entry point utama
+    # --------------------------------------------------------------------------
+
+    def run(self):
+        """
+        Jalankan seluruh pipeline preprocessing:
+            - Iterasi setiap citra di COCO JSON
+            - Terapkan sliding window → hasilkan patch 512x512
+            - Konversi anotasi COCO → YOLO per patch
+            - Simpan patch (.jpg) dan label (.txt) ke output_dir/all/
+
+        Output sementara disimpan ke output_dir/all/ sebelum di-split.
+        """
+        logger.info("=" * 60)
+        logger.info("Memulai preprocessing dataset DroneWaste")
+        logger.info(f"  Patch size : {self.patch_size}x{self.patch_size}")
+        logger.info(f"  Overlap    : {self.overlap * 100:.0f}%")
+        logger.info(f"  Stride     : {self.stride} piksel")
+        logger.info("=" * 60)
+
+        # Direktori sementara untuk semua patch sebelum split
+        all_images_dir = self.output_dir / "all" / "images"
+        all_labels_dir = self.output_dir / "all" / "labels"
+        all_images_dir.mkdir(parents=True, exist_ok=True)
+        all_labels_dir.mkdir(parents=True, exist_ok=True)
+
+        # Statistik proses
+        total_patches    = 0
+        total_with_annot = 0
+        skipped_images   = 0
+
+        # Iterasi semua citra di dataset
+        img_ids = list(self.coco.imgs.keys())
+
+        for img_id in tqdm(img_ids, desc="Memproses citra", unit="img"):
+            img_info = self.coco.imgs[img_id]
+            img_path = self.images_dir / img_info["file_name"]
+
+            # Skip jika file citra tidak ditemukan di disk
+            if not img_path.exists():
+                logger.warning(f"Citra tidak ditemukan, dilewati: {img_path}")
+                skipped_images += 1
+                continue
+
+            # Baca citra dengan OpenCV
+            image = cv2.imread(str(img_path))
+            if image is None:
+                logger.warning(f"Gagal membaca citra: {img_path}")
+                skipped_images += 1
+                continue
+
+            img_h, img_w = image.shape[:2]
+            img_stem     = Path(img_info["file_name"]).stem
+
+            # Muat semua anotasi untuk citra ini
+            ann_ids  = self.coco.getAnnIds(imgIds=img_id)
+            ann_list = self.coco.loadAnns(ann_ids)
+
+            # Jalankan sliding window pada citra ini
+            patches_count, annot_count = self._process_image_with_sliding_window(
+                image        = image,
+                img_w        = img_w,
+                img_h        = img_h,
+                img_stem     = img_stem,
+                ann_list     = ann_list,
+                out_img_dir  = all_images_dir,
+                out_lbl_dir  = all_labels_dir,
+            )
+
+            total_patches    += patches_count
+            total_with_annot += annot_count
+
+        logger.info("=" * 60)
+        logger.info(f"Preprocessing selesai!")
+        logger.info(f"  Total patch dihasilkan : {total_patches}")
+        logger.info(f"  Patch dengan anotasi   : {total_with_annot}")
+        logger.info(f"  Patch kosong (no obj)  : {total_patches - total_with_annot}")
+        logger.info(f"  Citra dilewati         : {skipped_images}")
+        logger.info("=" * 60)
+
+    # --------------------------------------------------------------------------
+    # PRIVATE: Sliding Window pada satu citra
+    # --------------------------------------------------------------------------
+
+    def _process_image_with_sliding_window(
         self,
-        image_id: int,
-        detections: Optional[List[dict]] = None,
-        grid_size: Tuple[int, int] = (8, 8),
-    ) -> np.ndarray:
+        image:       np.ndarray,
+        img_w:       int,
+        img_h:       int,
+        img_stem:    str,
+        ann_list:    list,
+        out_img_dir: Path,
+        out_lbl_dir: Path,
+    ) -> tuple[int, int]:
         """
-        Menghitung fitur per sel grid dari satu gambar.
-        Dapat dipanggil saat training (dari anotasi GT) maupun saat inference
-        (dari deteksi YOLO).
+        Terapkan overlapping sliding window pada satu citra.
+
+        Setiap patch diberi nama unik: {img_stem}_grid_{row}_{col}
+        Contoh: UAV_site01_grid_0_0, UAV_site01_grid_0_1, dst.
 
         Parameters
         ----------
-        image_id   : ID gambar di COCO
-        detections : list of dict dengan key:
-                       {bbox: [x,y,w,h], superclass_id: int, confidence: float}
-                     Kalau None, maka digunakan anotasi ground truth.
-        grid_size  : (n_rows, n_cols)
+        image       : Array citra OpenCV (H x W x C)
+        img_w/img_h : Dimensi citra asli
+        img_stem    : Nama file citra tanpa ekstensi
+        ann_list    : List anotasi COCO untuk citra ini
+        out_img_dir : Direktori output patch gambar
+        out_lbl_dir : Direktori output label YOLO
 
         Returns
         -------
-        np.ndarray shape (n_rows, n_cols, 2+NUM_SUPERCLASSES)
-          axis-2: [jumlah_sampah, kepadatan_pct, count_sc0, ..., count_sc4]
+        (jumlah_patch_total, jumlah_patch_berisi_anotasi)
         """
-        if not self._loaded:
-            self._load_coco()
-            self._build_category_map()
+        patches_count    = 0
+        annot_count      = 0
+        row_idx          = 0
 
-        img_info = self._img_info[image_id]
-        W = img_info["width"]
-        H = img_info["height"]
-        n_rows, n_cols = grid_size
+        # Geser jendela dari atas ke bawah
+        y_start = 0
+        while y_start < img_h:
+            # Clamp koordinat agar tidak melebihi batas citra
+            y_end = min(y_start + self.patch_size, img_h)
+            # Geser ke kiri kalau patch di ujung agar ukurannya tetap 512
+            if y_end - y_start < self.patch_size and y_start > 0:
+                y_start = max(0, img_h - self.patch_size)
+                y_end   = img_h
 
-        cell_w = W / n_cols
-        cell_h = H / n_rows
+            col_idx = 0
+            x_start = 0
 
-        # shape: (n_rows, n_cols, 2 + NUM_SUPERCLASSES)
-        # channels: [count, density_pct, sc0_cnt, sc1_cnt, ..., sc4_cnt]
-        features = np.zeros((n_rows, n_cols, 2 + NUM_SUPERCLASSES), dtype=np.float32)
+            # Geser jendela dari kiri ke kanan
+            while x_start < img_w:
+                x_end = min(x_start + self.patch_size, img_w)
+                if x_end - x_start < self.patch_size and x_start > 0:
+                    x_start = max(0, img_w - self.patch_size)
+                    x_end   = img_w
 
-        if detections is None:
-            # Gunakan ground truth dari COCO
-            raw_anns = self._ann_by_img.get(image_id, [])
-            boxes = []
-            for ann in raw_anns:
-                cid = ann["category_id"]
-                if cid not in self._cat_map:
-                    continue
-                sc_id, _ = self._cat_map[cid]
-                x, y, w, h = ann["bbox"]
-                boxes.append({"bbox": [x, y, w, h], "superclass_id": sc_id})
-        else:
-            boxes = detections
+                # Potong patch dari citra
+                patch = image[y_start:y_end, x_start:x_end]
 
-        for box in boxes:
-            x, y, w, h = box["bbox"]
-            sc_id       = box["superclass_id"]
-            bbox_area   = w * h  # piksel²
+                # Pad patch ke patch_size jika citra lebih kecil dari patch_size
+                patch = self._pad_patch(patch)
 
-            # Centroid objek → tentukan sel mana
-            cx = x + w / 2
-            cy = y + h / 2
-            col = min(int(cx / cell_w), n_cols - 1)
-            row = min(int(cy / cell_h), n_rows - 1)
+                # Nama unik patch: stem_grid_row_col
+                grid_name = f"{img_stem}_grid_{row_idx}_{col_idx}"
 
-            cell_area = cell_w * cell_h
-            density_contribution = (bbox_area / cell_area) * 100.0  # %
-
-            features[row, col, 0] += 1                     # jumlah_sampah
-            features[row, col, 1] += density_contribution  # kepadatan_%
-            features[row, col, 2 + sc_id] += 1             # count per superclass
-
-        # Clip kepadatan di 100% (overlap bbox bisa melebihi 100)
-        features[:, :, 1] = np.clip(features[:, :, 1], 0.0, 100.0)
-
-        return features
-
-    # ------------------------------------------------------------------
-    # PRIVATE — LOADING & PARSING
-    # ------------------------------------------------------------------
-
-    def _load_coco(self) -> None:
-        """Membaca annotations.json dan membangun index cepat."""
-        print(f"[dataset] Membaca {self.coco_json} ...")
-        with open(self.coco_json, "r") as f:
-            self._coco = json.load(f)
-
-        # Index: image_id → info
-        for img in self._coco["images"]:
-            self._img_info[img["id"]] = img
-
-        # Index: image_id → [annotations]
-        for ann in self._coco["annotations"]:
-            self._ann_by_img[ann["image_id"]].append(ann)
-
-        self._loaded = True
-        print(f"[dataset] {len(self._img_info)} gambar, "
-              f"{len(self._coco['annotations'])} anotasi dimuat.")
-
-    def _build_category_map(self) -> None:
-        """
-        Memetakan category_id COCO → (superclass_id, superclass_name).
-        Menampilkan warning untuk nama kategori yang tidak ada di SUPERCLASS_MAP.
-        """
-        unmapped = []
-        for cat in self._coco["categories"]:
-            name_key = cat["name"].lower().strip()
-            if name_key in SUPERCLASS_MAP:
-                self._cat_map[cat["id"]] = SUPERCLASS_MAP[name_key]
-            else:
-                # Fallback: masuk ke organic_mixed (id=4)
-                self._cat_map[cat["id"]] = (4, "organic_mixed")
-                unmapped.append(cat["name"])
-
-        if unmapped:
-            print(f"[dataset] WARNING: {len(unmapped)} kategori tidak ada di "
-                  f"SUPERCLASS_MAP, di-fallback ke 'organic_mixed':")
-            for n in unmapped:
-                print(f"          → '{n}'")
-            print("          Periksa SUPERCLASS_MAP di dataset.py jika ini salah.")
-
-        mapped_ok = len(self._coco["categories"]) - len(unmapped)
-        print(f"[dataset] Category map: {mapped_ok} terpetakan, "
-              f"{len(unmapped)} fallback.")
-
-    # ------------------------------------------------------------------
-    # PRIVATE — K-FOLD SPLIT
-    # ------------------------------------------------------------------
-
-    def _kfold_split(
-        self, n_folds: int, fold_idx: int
-    ) -> Tuple[List[int], List[int]]:
-        """
-        Membagi image_id menjadi train/val berdasarkan k-fold.
-        Stratified berdasarkan apakah gambar memiliki anotasi atau tidak
-        (memastikan background frame terdistribusi merata).
-        """
-        all_ids = sorted(self._img_info.keys())
-
-        # Pisahkan gambar dengan dan tanpa anotasi
-        has_ann  = [i for i in all_ids if len(self._ann_by_img.get(i, [])) > 0]
-        no_ann   = [i for i in all_ids if len(self._ann_by_img.get(i, [])) == 0]
-
-        rng = random.Random(self.seed)
-        rng.shuffle(has_ann)
-        rng.shuffle(no_ann)
-
-        def fold_split(ids: List[int]) -> Tuple[List[int], List[int]]:
-            fold_size = math.ceil(len(ids) / n_folds)
-            start     = fold_idx * fold_size
-            end       = min(start + fold_size, len(ids))
-            val   = ids[start:end]
-            train = ids[:start] + ids[end:]
-            return train, val
-
-        train_ann,  val_ann  = fold_split(has_ann)
-        train_noann, val_noann = fold_split(no_ann)
-
-        train_ids = train_ann  + train_noann
-        val_ids   = val_ann    + val_noann
-
-        rng.shuffle(train_ids)
-        rng.shuffle(val_ids)
-
-        print(f"[dataset] K-Fold {fold_idx+1}/{n_folds}: "
-              f"train={len(train_ids)}, val={len(val_ids)}")
-        return train_ids, val_ids
-
-    # ------------------------------------------------------------------
-    # PRIVATE — YOLO LABEL WRITER
-    # ------------------------------------------------------------------
-
-    def _write_yolo_labels(
-        self,
-        train_ids: List[int],
-        val_ids: List[int],
-        copy_images: bool,
-    ) -> Path:
-        """
-        Menulis file label YOLO (.txt) dan menyiapkan struktur folder
-        yang kompatibel dengan Ultralytics:
-
-          processed/
-            images/train/  images/val/
-            labels/train/  labels/val/
-        """
-        base = self.output_dir
-        for split in ("train", "val"):
-            (base / "images" / split).mkdir(parents=True, exist_ok=True)
-            (base / "labels" / split).mkdir(parents=True, exist_ok=True)
-
-        for split_name, ids in [("train", train_ids), ("val", val_ids)]:
-            img_out_dir = base / "images" / split_name
-            lbl_out_dir = base / "labels" / split_name
-
-            for image_id in ids:
-                info     = self._img_info[image_id]
-                src_img  = self.images_dir / info["file_name"]
-                dst_img  = img_out_dir / info["file_name"]
-
-                # -- salin / symlink gambar --
-                if not dst_img.exists():
-                    if copy_images:
-                        shutil.copy2(src_img, dst_img)
-                    else:
-                        try:
-                            dst_img.symlink_to(src_img.resolve())
-                        except (OSError, NotImplementedError):
-                            # Windows mungkin perlu hak admin untuk symlink
-                            shutil.copy2(src_img, dst_img)
-
-                # -- tulis label YOLO --
-                W = info["width"]
-                H = info["height"]
-                stem = Path(info["file_name"]).stem
-                lbl_path = lbl_out_dir / f"{stem}.txt"
-
-                lines = []
-                for ann in self._ann_by_img.get(image_id, []):
-                    cid = ann["category_id"]
-                    if cid not in self._cat_map:
-                        continue
-                    sc_id, _ = self._cat_map[cid]
-
-                    # COCO bbox: [x_top_left, y_top_left, width, height]
-                    # YOLO bbox: [cx, cy, w, h]  — semua dinormalisasi 0-1
-                    bx, by, bw, bh = ann["bbox"]
-                    cx = (bx + bw / 2) / W
-                    cy = (by + bh / 2) / H
-                    nw = bw / W
-                    nh = bh / H
-
-                    # Validasi agar tidak ada nilai di luar [0,1]
-                    cx, cy = max(0.0, min(1.0, cx)), max(0.0, min(1.0, cy))
-                    nw, nh = max(0.0, min(1.0, nw)), max(0.0, min(1.0, nh))
-
-                    if nw > 0 and nh > 0:
-                        lines.append(f"{sc_id} {cx:.6f} {cy:.6f} {nw:.6f} {nh:.6f}")
-
-                with open(lbl_path, "w") as f:
-                    f.write("\n".join(lines))
-
-        print(f"[dataset] Label YOLO ditulis ke {base}")
-        return base
-
-    def _write_dataset_yaml(self, yolo_dir: Path) -> Path:
-        """
-        Menulis dataset.yaml yang dibutuhkan oleh Ultralytics YOLO.
-        """
-        yaml_path = yolo_dir / "dataset.yaml"
-        names_str = "\n".join(
-            f"  {i}: {name}" for i, name in enumerate(SUPERCLASS_NAMES)
-        )
-        content = (
-            f"# AeroSweep — DroneWaste dataset config\n"
-            f"# Auto-generated oleh dataset.py\n\n"
-            f"path: {yolo_dir.resolve()}\n"
-            f"train: images/train\n"
-            f"val:   images/val\n\n"
-            f"nc: {NUM_SUPERCLASSES}\n"
-            f"names:\n{names_str}\n"
-        )
-        with open(yaml_path, "w") as f:
-            f.write(content)
-        print(f"[dataset] dataset.yaml ditulis ke {yaml_path}")
-        return yaml_path
-
-    # ------------------------------------------------------------------
-    # PRIVATE — GRID CSV WRITER
-    # ------------------------------------------------------------------
-
-    def _write_grid_csv(self, grid_size: Tuple[int, int]) -> Path:
-        """
-        Menghasilkan tabel grid untuk seluruh dataset dan menyimpannya
-        sebagai CSV di data/tabular/grid_results.csv.
-
-        Kolom output:
-          image_id, file_name, grid_row, grid_col,
-          jumlah_sampah, kepadatan_pct,
-          count_plastic_packaging, count_metal_glass,
-          count_construction, count_hazardous, count_organic_mixed
-        """
-        tabular_dir = Path("data/tabular")
-        tabular_dir.mkdir(parents=True, exist_ok=True)
-        csv_path = tabular_dir / "grid_results.csv"
-
-        n_rows, n_cols = grid_size
-
-        header = (
-            "image_id,file_name,grid_row,grid_col,"
-            "jumlah_sampah,kepadatan_pct,"
-            "count_plastic_packaging,count_metal_glass,"
-            "count_construction,count_hazardous,count_organic_mixed\n"
-        )
-
-        with open(csv_path, "w") as f:
-            f.write(header)
-
-            for image_id, info in self._img_info.items():
-                features = self.compute_grid_features(
-                    image_id, detections=None, grid_size=grid_size
+                # Konversi anotasi COCO ke YOLO untuk patch ini
+                yolo_labels = self._convert_annotations_to_yolo(
+                    ann_list = ann_list,
+                    patch_x  = x_start,
+                    patch_y  = y_start,
+                    patch_w  = x_end - x_start,
+                    patch_h  = y_end - y_start,
+                    img_w    = img_w,
+                    img_h    = img_h,
                 )
-                # features shape: (n_rows, n_cols, 2+5)
-                for r in range(n_rows):
-                    for c in range(n_cols):
-                        feat = features[r, c]
-                        count    = int(feat[0])
-                        density  = round(float(feat[1]), 4)
-                        sc_cnts  = [int(feat[2 + s]) for s in range(NUM_SUPERCLASSES)]
 
-                        # Hanya tulis sel yang memiliki setidaknya 1 deteksi
-                        # (sel kosong bisa di-include dengan mengubah kondisi ini)
-                        if count > 0:
-                            row_str = (
-                                f"{image_id},{info['file_name']},"
-                                f"{r},{c},"
-                                f"{count},{density},"
-                                + ",".join(str(s) for s in sc_cnts)
-                                + "\n"
-                            )
-                            f.write(row_str)
+                # Simpan patch gambar (.jpg)
+                img_out_path = out_img_dir / f"{grid_name}.jpg"
+                cv2.imwrite(str(img_out_path), patch)
 
-        print(f"[dataset] Grid CSV ditulis ke {csv_path}")
-        return csv_path
+                # Simpan label YOLO (.txt) — kosong jika tidak ada anotasi
+                lbl_out_path = out_lbl_dir / f"{grid_name}.txt"
+                with open(lbl_out_path, "w") as f:
+                    f.write("\n".join(yolo_labels))
 
+                patches_count += 1
+                if yolo_labels:
+                    annot_count += 1
 
-# ---------------------------------------------------------------------------
-# 3. FUNGSI UTILITAS STANDALONE
-# ---------------------------------------------------------------------------
+                # Pindah ke patch berikutnya (horizontal)
+                if x_end >= img_w:
+                    break
+                x_start += self.stride
+                col_idx += 1
 
-def verify_coco_json(coco_json: str | Path) -> None:
-    """
-    Verifikasi cepat struktur COCO JSON DroneWaste.
-    Cetak statistik dasar dan daftar nama kategori asli —
-    berguna untuk menyesuaikan SUPERCLASS_MAP.
-    """
-    with open(coco_json) as f:
-        data = json.load(f)
+            # Pindah ke patch berikutnya (vertikal)
+            if y_end >= img_h:
+                break
+            y_start += self.stride
+            row_idx += 1
 
-    print("=" * 50)
-    print("  COCO JSON Verification")
-    print("=" * 50)
-    print(f"  Gambar     : {len(data.get('images', []))}")
-    print(f"  Anotasi    : {len(data.get('annotations', []))}")
-    print(f"  Kategori   : {len(data.get('categories', []))}")
-    print()
-    print("  Nama kategori asli:")
-    for cat in sorted(data.get("categories", []), key=lambda x: x["id"]):
-        print(f"    [{cat['id']:3d}] {cat['name']}")
-    print("=" * 50)
+        return patches_count, annot_count
 
+    def _pad_patch(self, patch: np.ndarray) -> np.ndarray:
+        """
+        Pad patch dengan warna hitam ke ukuran patch_size x patch_size.
+        Diperlukan untuk patch di tepi citra yang lebih kecil dari patch_size.
 
-def coco_to_yolo_single(
-    ann: dict,
-    img_width: int,
-    img_height: int,
-    superclass_id: int,
-) -> Optional[str]:
-    """
-    Konversi satu anotasi COCO ke satu baris YOLO.
-    Mengembalikan None jika bbox tidak valid.
-    """
-    bx, by, bw, bh = ann["bbox"]
-    if bw <= 0 or bh <= 0:
-        return None
-    cx = (bx + bw / 2) / img_width
-    cy = (by + bh / 2) / img_height
-    nw = bw / img_width
-    nh = bh / img_height
-    return f"{superclass_id} {cx:.6f} {cy:.6f} {nw:.6f} {nh:.6f}"
+        Parameters
+        ----------
+        patch : Array patch yang mungkin lebih kecil dari patch_size
 
+        Returns
+        -------
+        Patch berukuran tepat patch_size x patch_size
+        """
+        h, w = patch.shape[:2]
+        if h == self.patch_size and w == self.patch_size:
+            return patch  # Tidak perlu padding
 
-# ---------------------------------------------------------------------------
-# 4. CONTOH PENGGUNAAN (jalankan sebagai script)
-# ---------------------------------------------------------------------------
+        padded = np.zeros(
+            (self.patch_size, self.patch_size, 3),
+            dtype=np.uint8
+        )
+        padded[:h, :w] = patch
+        return padded
 
-if __name__ == "__main__":
-    import argparse
+    # --------------------------------------------------------------------------
+    # PRIVATE: Konversi Anotasi COCO → YOLO per Patch
+    # --------------------------------------------------------------------------
 
-    parser = argparse.ArgumentParser(description="AeroSweep — Dataset Preparation")
-    parser.add_argument(
-        "--coco_json",
-        default="data/vision/raw/dronewaste_v1.0.json",
-        help="Path ke file annotations.json DroneWaste",
-    )
-    parser.add_argument(
-        "--images_dir",
-        default="data/vision/raw/images",
-        help="Direktori gambar raw",
-    )
-    parser.add_argument(
-        "--output_dir",
-        default="data/vision/processed",
-        help="Direktori output processed",
-    )
-    parser.add_argument(
-        "--grid_rows", type=int, default=8,
-        help="Jumlah baris grid per gambar",
-    )
-    parser.add_argument(
-        "--grid_cols", type=int, default=8,
-        help="Jumlah kolom grid per gambar",
-    )
-    parser.add_argument(
-        "--n_folds", type=int, default=5,
-        help="Jumlah fold untuk k-fold CV",
-    )
-    parser.add_argument(
-        "--fold_idx", type=int, default=0,
-        help="Fold yang dipakai sebagai validasi (0-based)",
-    )
-    parser.add_argument(
-        "--verify_only", action="store_true",
-        help="Hanya verifikasi COCO JSON tanpa memproses",
-    )
-    args = parser.parse_args()
+    def _convert_annotations_to_yolo(
+        self,
+        ann_list: list,
+        patch_x:  int,
+        patch_y:  int,
+        patch_w:  int,
+        patch_h:  int,
+        img_w:    int,
+        img_h:    int,
+    ) -> list[str]:
+        """
+        Konversi anotasi COCO (poligon) ke format segmentasi YOLO untuk
+        satu patch spesifik.
 
-    if args.verify_only:
-        verify_coco_json(args.coco_json)
-    else:
-        ds = DroneWasteDataset(
-            coco_json   = args.coco_json,
-            images_dir  = args.images_dir,
-            output_dir  = args.output_dir,
+        Format YOLO Segmentation per baris:
+            class_id x1 y1 x2 y2 ... xn yn
+        Semua koordinat dinormalisasi ke [0.0, 1.0] relatif terhadap patch.
+
+        Parameters
+        ----------
+        ann_list : Semua anotasi COCO untuk citra ini
+        patch_x  : Koordinat x kiri-atas patch di citra asli
+        patch_y  : Koordinat y kiri-atas patch di citra asli
+        patch_w  : Lebar patch di citra asli (sebelum padding)
+        patch_h  : Tinggi patch di citra asli (sebelum padding)
+
+        Returns
+        -------
+        List string YOLO label, satu string per objek.
+        List kosong jika tidak ada objek yang terlihat di patch.
+        """
+        yolo_labels = []
+
+        for ann in ann_list:
+            # Ambil YOLO class ID dari mapping
+            yolo_class_id = self.coco_id_to_yolo_id.get(ann["category_id"])
+            if yolo_class_id is None:
+                continue  # Kelas tidak dikenal, lewati
+
+            # Ambil bounding box COCO: [x_min, y_min, width, height]
+            bbox = ann.get("bbox", [])
+            if not bbox:
+                continue
+
+            bx, by, bw, bh = bbox
+
+            # Cek apakah bounding box beririsan dengan patch ini
+            # Irisan antara bbox dan patch
+            inter_x1 = max(bx, patch_x)
+            inter_y1 = max(by, patch_y)
+            inter_x2 = min(bx + bw, patch_x + patch_w)
+            inter_y2 = min(by + bh, patch_y + patch_h)
+
+            # Tidak ada irisan → lewati anotasi ini
+            if inter_x2 <= inter_x1 or inter_y2 <= inter_y1:
+                continue
+
+            # Hitung rasio visibilitas bbox dalam patch
+            inter_area = (inter_x2 - inter_x1) * (inter_y2 - inter_y1)
+            bbox_area  = bw * bh
+            if bbox_area <= 0:
+                continue
+
+            visibility = inter_area / bbox_area
+            if visibility < self.min_visibility:
+                continue  # Objek terlalu sedikit terlihat → lewati
+
+            # Proses segmentasi poligon
+            segmentation = ann.get("segmentation", [])
+
+            if not segmentation:
+                continue
+
+            # Tangani format RLE (Run-Length Encoding) dari COCO
+            if isinstance(segmentation, dict):
+                # Format RLE → decode ke binary mask → ambil kontur
+                binary_mask = coco_mask_utils.decode(segmentation)
+                contours, _ = cv2.findContours(
+                    binary_mask.astype(np.uint8),
+                    cv2.RETR_EXTERNAL,
+                    cv2.CHAIN_APPROX_SIMPLE
+                )
+                if not contours:
+                    continue
+                # Ambil kontur terbesar
+                largest = max(contours, key=cv2.contourArea)
+                poly    = largest.flatten().tolist()
+                polygons = [poly]
+
+            else:
+                # Format poligon biasa: list of list koordinat
+                polygons = segmentation
+
+            # Proses setiap poligon dalam anotasi
+            for poly in polygons:
+                if len(poly) < 6:
+                    # Poligon valid minimal 3 titik (6 koordinat)
+                    continue
+
+                # Konversi koordinat poligon ke ruang patch + normalisasi
+                clipped_poly = self._clip_polygon_to_patch(
+                    poly    = poly,
+                    patch_x = patch_x,
+                    patch_y = patch_y,
+                    patch_w = self.patch_size,  # Gunakan patch_size untuk normalisasi
+                    patch_h = self.patch_size,
+                )
+
+                if clipped_poly is None:
+                    continue
+
+                # Format: "class_id x1 y1 x2 y2 ... xn yn"
+                coords_str = " ".join(
+                    f"{v:.6f}" for v in clipped_poly
+                )
+                yolo_labels.append(f"{yolo_class_id} {coords_str}")
+
+        return yolo_labels
+
+    def _clip_polygon_to_patch(
+        self,
+        poly:    list,
+        patch_x: int,
+        patch_y: int,
+        patch_w: int,
+        patch_h: int,
+    ) -> Optional[list]:
+        """
+        Clip dan normalisasi koordinat poligon ke ruang koordinat patch.
+
+        Langkah:
+        1. Geser koordinat relatif terhadap sudut kiri-atas patch
+        2. Clip ke dalam batas [0, patch_size]
+        3. Normalisasi ke [0.0, 1.0]
+
+        Parameters
+        ----------
+        poly    : List koordinat poligon [x1, y1, x2, y2, ...]
+        patch_x : Offset x patch di citra asli
+        patch_y : Offset y patch di citra asli
+        patch_w : Lebar patch (untuk normalisasi)
+        patch_h : Tinggi patch (untuk normalisasi)
+
+        Returns
+        -------
+        List koordinat ternormalisasi, atau None jika poligon tidak valid.
+        """
+        # Pisahkan x dan y
+        xs = poly[0::2]
+        ys = poly[1::2]
+
+        # Geser ke ruang patch dan clip ke [0, patch_size]
+        xs_local = [
+            max(0.0, min(float(x) - patch_x, patch_w)) for x in xs
+        ]
+        ys_local = [
+            max(0.0, min(float(y) - patch_y, patch_h)) for y in ys
+        ]
+
+        # Normalisasi ke [0.0, 1.0]
+        xs_norm = [x / patch_w for x in xs_local]
+        ys_norm = [y / patch_h for y in ys_local]
+
+        # Susun kembali: [x1, y1, x2, y2, ...]
+        coords_norm = []
+        for x, y in zip(xs_norm, ys_norm):
+            coords_norm.extend([x, y])
+
+        # Validasi: minimal 3 titik unik (6 nilai)
+        if len(coords_norm) < 6:
+            return None
+
+        # Validasi: poligon tidak boleh degenerasi (semua titik sama)
+        unique_x = set(xs_norm)
+        unique_y = set(ys_norm)
+        if len(unique_x) < 2 or len(unique_y) < 2:
+            return None
+
+        return coords_norm
+
+    # --------------------------------------------------------------------------
+    # PUBLIC: Split dataset → train / val
+    # --------------------------------------------------------------------------
+
+    def split_dataset(self):
+        """
+        Bagi semua patch dari output_dir/all/ ke:
+            - output_dir/train/images/ dan output_dir/train/labels/
+            - output_dir/val/images/   dan output_dir/val/labels/
+
+        Rasio split diambil dari self.train_val_split (default 0.8).
+        Split dilakukan berdasarkan nama file gambar (bukan per citra asli)
+        secara acak dengan seed yang sudah diset.
+
+        Setelah split selesai, folder output_dir/all/ dihapus untuk
+        menghemat storage.
+        """
+        logger.info("Memulai split dataset train/val...")
+
+        all_images_dir = self.output_dir / "all" / "images"
+        all_labels_dir = self.output_dir / "all" / "labels"
+
+        # Kumpulkan semua file gambar patch
+        all_image_files = sorted(all_images_dir.glob("*.jpg"))
+
+        if not all_image_files:
+            logger.error(
+                "Tidak ada patch ditemukan di output_dir/all/images/. "
+                "Jalankan run() terlebih dahulu."
+            )
+            return
+
+        # Acak urutan file dengan seed
+        random.shuffle(all_image_files)
+
+        # Hitung jumlah data train
+        n_total = len(all_image_files)
+        n_train = int(n_total * self.train_val_split)
+
+        train_files = all_image_files[:n_train]
+        val_files   = all_image_files[n_train:]
+
+        logger.info(
+            f"Split: {n_total} patch total → "
+            f"{len(train_files)} train / {len(val_files)} val"
         )
 
-        # Cek distribusi kelas sebelum prepare
-        print("\n[dataset] Distribusi superkategori (ground truth):")
-        dist = ds.get_class_distribution()
-        for name, cnt in sorted(dist.items(), key=lambda x: -x[1]):
-            print(f"  {name:<25} : {cnt:>5} instance")
+        # Salin file ke direktori train/val
+        for split_name, file_list in [("train", train_files), ("val", val_files)]:
+            img_dst = self.output_dir / split_name / "images"
+            lbl_dst = self.output_dir / split_name / "labels"
 
-        paths = ds.prepare(
-            grid_size = (args.grid_rows, args.grid_cols),
-            n_folds   = args.n_folds,
-            fold_idx  = args.fold_idx,
+            for img_path in tqdm(
+                file_list,
+                desc=f"Menyalin ke {split_name}",
+                unit="file"
+            ):
+                # Salin gambar
+                shutil.copy2(img_path, img_dst / img_path.name)
+
+                # Salin label (nama sama, ekstensi .txt)
+                lbl_path = all_labels_dir / (img_path.stem + ".txt")
+                if lbl_path.exists():
+                    shutil.copy2(lbl_path, lbl_dst / lbl_path.name)
+                else:
+                    # Buat file label kosong jika tidak ada
+                    # (patch tanpa objek tetap diperlukan untuk training)
+                    (lbl_dst / (img_path.stem + ".txt")).touch()
+
+        # Hapus folder sementara 'all' setelah split selesai
+        logger.info("Menghapus folder sementara 'all'...")
+        shutil.rmtree(self.output_dir / "all")
+
+        logger.info("Split dataset selesai!")
+        logger.info(
+            f"  Train → {self.output_dir / 'train'}"
+        )
+        logger.info(
+            f"  Val   → {self.output_dir / 'val'}"
         )
 
-        print("\nOutput paths:")
-        for k, v in paths.items():
-            print(f"  {k:<12} : {v}")
+    # --------------------------------------------------------------------------
+    # PUBLIC: Utilitas — ringkasan statistik dataset
+    # --------------------------------------------------------------------------
+
+    def print_dataset_summary(self):
+        """
+        Tampilkan ringkasan statistik dataset:
+        - Jumlah citra, anotasi, kelas
+        - Distribusi anotasi per kelas
+        """
+        logger.info("=" * 60)
+        logger.info("RINGKASAN DATASET DroneWaste")
+        logger.info("=" * 60)
+        logger.info(f"File JSON : {self.coco_json_path}")
+        logger.info(f"Total citra    : {len(self.coco.imgs)}")
+        logger.info(f"Total anotasi  : {len(self.coco.anns)}")
+        logger.info(f"Total kelas    : {len(self.class_names)}")
+        logger.info("")
+        logger.info("Distribusi anotasi per kelas:")
+
+        # Hitung jumlah anotasi per kelas
+        class_counts = {yolo_id: 0 for yolo_id in self.class_names}
+        for ann in self.coco.anns.values():
+            yolo_id = self.coco_id_to_yolo_id.get(ann["category_id"])
+            if yolo_id is not None:
+                class_counts[yolo_id] += 1
+
+        for yolo_id, name in self.class_names.items():
+            count = class_counts[yolo_id]
+            bar   = "█" * min(count, 50)
+            logger.info(f"  [{yolo_id:2d}] {name:<25} {count:4d} {bar}")
+
+        logger.info("=" * 60)

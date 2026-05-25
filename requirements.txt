@@ -1,13 +1,83 @@
-# Add dependencies here
-# torch
-# torchvision
-# opencv-python
-# numpy
-# pandas
-# scikit-learn
-# scikit-fuzzy
-# deap
-# fastapi
-# uvicorn
-# streamlit
-# gradio
+# ==============================================================================
+# AeroSweep — Requirements
+# Modul: Computer Vision / ANN (Instance Segmentation)
+# Python: 3.10+
+# Terakhir diperbarui: 2025
+# ==============================================================================
+# Cara install:
+#   pip install -r requirements.txt
+# ==============================================================================
+
+
+# ------------------------------------------------------------------------------
+# 1. DEEP LEARNING & COMPUTER VISION — Inti pipeline ANN
+# ------------------------------------------------------------------------------
+
+# Framework utama instance segmentation (YOLOv8, YOLO11, dsb.)
+# Dokumentasi resmi: https://docs.ultralytics.com
+ultralytics>=8.3.0
+
+# Deep learning backend (CPU/GPU)
+# Versi CUDA disesuaikan dengan driver GPU masing-masing
+# Install manual jika pakai GPU: https://pytorch.org/get-started/locally/
+torch>=2.1.0
+torchvision>=0.16.0
+
+# Computer vision: baca/tulis gambar, operasi piksel, moments, kontur
+opencv-python>=4.9.0
+
+# ------------------------------------------------------------------------------
+# 2. DATA MANIPULATION & EKSPOR — Untuk ekstraksi fitur dan ekspor ke tim Fuzzy
+# ------------------------------------------------------------------------------
+
+# Manipulasi array multidimensi (masking, kalkulasi piksel)
+numpy>=1.26.0
+
+# DataFrame dan ekspor CSV (output utama ke tim GA-Fuzzy)
+pandas>=2.2.0
+
+# ------------------------------------------------------------------------------
+# 3. ANOTASI & FORMAT DATA — Untuk parsing COCO JSON
+# ------------------------------------------------------------------------------
+
+# Parser anotasi COCO JSON (dronewaste_v1.0.json)
+# Library resmi dari tim COCO: https://github.com/cocodataset/cocoapi
+pycocotools>=2.0.7
+
+# ------------------------------------------------------------------------------
+# 4. KONFIGURASI & UTILITAS PIPELINE
+# ------------------------------------------------------------------------------
+
+# Baca file konfigurasi YAML (cv.yaml, configs/)
+PyYAML>=6.0.1
+
+# Progress bar saat preprocessing batch besar (sliding window 3.9 GB)
+tqdm>=4.66.0
+
+# Manipulasi path file lintas OS (Windows/Linux/Mac)
+# Catatan: pathlib sudah built-in Python 3.4+, ini hanya untuk kepastian versi
+# (tidak perlu install terpisah, sudah included di Python stdlib)
+
+# ------------------------------------------------------------------------------
+# 5. VISUALISASI — Untuk notebooks/02_visual_check.ipynb
+# ------------------------------------------------------------------------------
+
+# Plot distribusi kelas, heatmap kepadatan, visualisasi metrik
+matplotlib>=3.8.0
+
+# Heatmap kepadatan sampah per grid (lebih cantik dari matplotlib default)
+seaborn>=0.13.0
+
+# Notebook interaktif (visualisasi hasil preprocessing & inferensi)
+jupyter>=1.0.0
+ipykernel>=6.29.0
+
+# ------------------------------------------------------------------------------
+# 6. OPSIONAL — Monitoring training (aktifkan jika diperlukan)
+# ------------------------------------------------------------------------------
+
+# Uncomment jika ingin logging training curves secara visual
+# tensorboard>=2.16.0
+
+# Uncomment jika tim menggunakan Weights & Biases untuk experiment tracking
+# wandb>=0.16.0

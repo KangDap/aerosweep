@@ -1,140 +1,63 @@
-# =============================================================================
-# AeroSweep — Konfigurasi Training Computer Vision
-# configs/cv.yaml
-# =============================================================================
-# Semua parameter training terpusat di sini.
-# Ubah file ini untuk eksperimen — tidak perlu menyentuh script Python.
-#
-# Penggunaan di script:
-#   import yaml
-#   cfg = yaml.safe_load(open("configs/cv.yaml"))
-# =============================================================================
-
-
-# -----------------------------------------------------------------------------
-# MODEL
-# -----------------------------------------------------------------------------
-model:
-  architecture: yolov8x             # yolov8n | yolov8s | yolov8m | yolov8l | yolov8x
-  pretrained_weights: yolov8x.pt    # download otomatis oleh Ultralytics saat pertama run
-  num_classes: 5                    # jumlah superkategori (jangan diubah)
-  class_names:
-    - plastic_packaging             # 0
-    - metal_glass                   # 1
-    - construction                  # 2
-    - hazardous                     # 3
-    - organic_mixed                 # 4
-
-
-# -----------------------------------------------------------------------------
-# DATA
-# -----------------------------------------------------------------------------
-data:
-  coco_json:      data/vision/raw/dronewaste_v1.0.json
-  images_dir:     data/vision/raw/images
-  processed_dir:  data/vision/processed
-  tabular_dir:    data/tabular
-
-  # Pembagian sel grid per gambar untuk output ke Fuzzy
-  # (8x8) = 64 sel per frame — cukup granular untuk RTX 3060
-  grid_size: [8, 8]
-
-  # Resolusi input model — 640 adalah default YOLO, aman di 12GB VRAM
-  # Naikan ke 1280 untuk akurasi lebih tinggi (VRAM ~+3GB)
-  imgsz: 640
-
-
-# -----------------------------------------------------------------------------
-# CROSS VALIDATION
-# -----------------------------------------------------------------------------
-cross_validation:
-  n_folds: 5          # 5-fold: 80% train, 20% val per fold
-  seed: 42            # seed untuk reproducibility — jangan diubah setelah eksperimen dimulai
-  fold_idx: 0         # fold aktif untuk training saat ini (0-based, 0–4)
-                      # ubah ke 1,2,3,4 untuk melatih semua fold
-
-
-# -----------------------------------------------------------------------------
-# PARAMETER TRAINING
-# -----------------------------------------------------------------------------
-train:
-  epochs: 100               # cukup untuk dataset ~4000 gambar dengan pretrained weights
-  batch: 8                  # aman di RTX 3060 12GB untuk YOLOv8x + imgsz=640
-                            # naikan ke 16 kalau VRAM masih ada sisa
-  workers: 4                # thread DataLoader — sesuaikan dengan jumlah CPU core
-  device: 0                 # GPU index: 0 = GPU pertama | "cpu" = CPU only
-
-  # --- Learning Rate ---
-  optimizer: AdamW          # AdamW | SGD | Adam
-  lr0: 0.001                # learning rate awal — lebih rendah dari default (0.01)
-                            # karena kita fine-tune pretrained, bukan train from scratch
-  lrf: 0.0001               # learning rate akhir (lr0 * lrf = lr minimum)
-  momentum: 0.937           # hanya berlaku untuk SGD
+path: data/vision
+train: processed/train/images
+val: processed/val/images
+test: raw/images
+nc: 20
+names:
+  0: Rubble
+  1: Construction and demolition materials
+  2: Asphalt milling
+  3: Excavation materials
+  4: Appliances
+  5: Electronic equipment
+  6: Furniture
+  7: Metal barrels
+  8: Plastic packaging
+  9: Wood
+  10: Pallets
+  11: Scrap
+  12: Plastic
+  13: Vehicles
+  14: Tyres
+  15: Paper
+  16: Foundry
+  17: Asbestos
+  18: Textile
+  19: Mixed items
+preprocessing:
+  patch_size: 512
+  overlap: 0.2
+  train_val_split: 0.8
+  random_seed: 42
+  grid_naming_pattern: '{image_stem}_grid_{row}_{col}'
+  min_visibility: 0.1
+training:
+  model: yolo11n-seg.pt
+  epochs: 100
+  batch: 16
+  imgsz: 512
+  lr0: 0.01
+  lrf: 0.01
+  momentum: 0.937
   weight_decay: 0.0005
-
-  # --- Scheduler ---
-  warmup_epochs: 3.0        # linear warmup di awal training
-  warmup_momentum: 0.8
-  warmup_bias_lr: 0.1
-
-  # --- Early Stopping ---
-  patience: 20              # stop kalau mAP tidak membaik setelah 20 epoch
-                            # set ke 0 untuk disable early stopping
-
-  # --- Augmentasi ---
-  # Augmentasi dioptimalkan untuk citra aerial/UAV
-  hsv_h: 0.015              # variasi hue (warna) — kecil, karena warna sampah khas
-  hsv_s: 0.5                # variasi saturasi
-  hsv_v: 0.4                # variasi kecerahan — penting untuk variasi cahaya UAV
-  degrees: 0.0              # rotasi acak — di-disable, pakai flip saja (lebih stabil)
-  translate: 0.1            # translasi acak
-  scale: 0.5                # zoom in/out — penting untuk variasi ketinggian UAV
-  shear: 0.0                # shear — tidak relevan untuk aerial
-  perspective: 0.0          # perspective transform — disable untuk aerial nadir
-  flipud: 0.5               # flip vertikal — valid untuk aerial (tidak ada "atas/bawah")
-  fliplr: 0.5               # flip horizontal — valid untuk aerial
-  mosaic: 1.0               # mosaic augmentation — sangat efektif untuk objek kecil
-  mixup: 0.1                # mixup augmentation — ringan
-  copy_paste: 0.0           # copy-paste — disable (butuh segmentation mask)
-
-  # --- Lainnya ---
-  close_mosaic: 10          # matikan mosaic di 10 epoch terakhir untuk stabilisasi
-  cache: false              # true = cache gambar di RAM (butuh ~8GB RAM ekstra)
-                            # aktifkan kalau RAM >= 16GB untuk training lebih cepat
-  exist_ok: false           # false = buat folder run baru setiap training
-  plots: true               # simpan grafik loss, mAP, confusion matrix
-
-
-# -----------------------------------------------------------------------------
-# OUTPUT & LOGGING
-# -----------------------------------------------------------------------------
-output:
-  weights_dir: models/nn_weights    # folder simpan bobot model terbaik
-  runs_dir: models/nn_weights/runs  # folder Ultralytics run (loss curve, plots)
-  project: AeroSweep                # nama project di Ultralytics
-  experiment_name: fold_{fold_idx}  # nama run — fold_0, fold_1, dst
-
-
-# -----------------------------------------------------------------------------
-# INFERENCE (dipakai oleh inference_cv.py)
-# -----------------------------------------------------------------------------
-inference:
-  confidence_threshold: 0.25   # deteksi di bawah ini diabaikan
-  iou_threshold: 0.45           # threshold NMS (Non-Maximum Suppression)
-  max_detections: 300           # maksimum objek per gambar
+  patience: 20
+  project: models/nn_weights
+  name: aerosweep_trained
+  save_period: -1
   device: 0
-
-
-# -----------------------------------------------------------------------------
-# CATATAN EKSPERIMEN
-# -----------------------------------------------------------------------------
-# Gunakan bagian ini untuk mendokumentasikan eksperimen yang sudah dicoba.
-# Format: tanggal | perubahan | hasil mAP@50
-#
-# experiments:
-#   - date: 2025-xx-xx
-#     change: "baseline fold_0"
-#     map50: ~
-#   - date: 2025-xx-xx
-#     change: "batch 16, epochs 150"
-#     map50: ~
+  workers: 8
+  augment: true
+  seed: 42
+  verbose: true
+inference:
+  model_path: models\nn_weights\aerosweep_trained\weights\best.pt
+  source: data/vision/processed/val/images
+  conf_threshold: 0.25
+  iou_threshold: 0.45
+  device: 0
+  imgsz: 512
+  output_dir: outputs
+  output_csv: output_fitur_ann_ke_fuzzy.csv
+  visualize: false
+  save_annotated: true
+  annotated_dir: outputs/annotated_grids

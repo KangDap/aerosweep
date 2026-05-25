@@ -1,246 +1,550 @@
-"""
-src/aerosweep/neuro/train_cv.py
-================================
-Pipeline training YOLOv8x untuk AeroSweep dengan K-Fold Cross Validation.
+# ==============================================================================
+# AeroSweep — Modul Training
+# File: src/aerosweep/neuro/train_cv.py
+#
+# Tanggung jawab:
+#   1. Membaca konfigurasi training dari configs/cv.yaml
+#   2. Memvalidasi dataset hasil preprocessing sudah siap
+#   3. Fine-tuning model YOLO11n-seg (instance segmentation)
+#   4. Menyimpan bobot terbaik ke models/nn_weights/aerosweep_trained/
+#   5. Mengekspor ringkasan hasil training
+#
+# Dipanggil oleh: scripts/02_train_cv.py
+# ==============================================================================
 
-Cara pakai:
-  # Training fold 0 (default):
-  python src/aerosweep/neuro/train_cv.py
-
-  # Training fold tertentu:
-  python src/aerosweep/neuro/train_cv.py --fold 2
-
-  # Training semua fold sekaligus:
-  python src/aerosweep/neuro/train_cv.py --all_folds
-
-  # Pakai config custom:
-  python src/aerosweep/neuro/train_cv.py --config configs/cv.yaml --fold 0
-
-Output:
-  models/nn_weights/runs/AeroSweep/fold_0/weights/best.pt
-  models/nn_weights/runs/AeroSweep/fold_0/weights/last.pt
-  models/nn_weights/runs/AeroSweep/fold_0/results.csv   ← loss & mAP per epoch
-"""
-
-from __future__ import annotations
-
-import argparse
+import logging
+import shutil
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 import yaml
+from ultralytics import YOLO
 
-# ---------------------------------------------------------------------------
-# Pastikan root project ada di sys.path agar bisa import modul aerosweep
-# ---------------------------------------------------------------------------
-ROOT = Path(__file__).resolve().parents[3]   # src/aerosweep/neuro/ → root
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-from src.aerosweep.neuro.dataset import DroneWasteDataset  # noqa: E402
-
-
-# ---------------------------------------------------------------------------
-# UTILITAS
-# ---------------------------------------------------------------------------
-
-def load_config(config_path: str | Path) -> dict:
-    """Membaca cv.yaml dan mengembalikan dict konfigurasi."""
-    with open(config_path, "r") as f:
-        cfg = yaml.safe_load(f)
-    return cfg
+# ------------------------------------------------------------------------------
+# Setup Logger
+# ------------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("AeroSweep.train_cv")
 
 
-def prepare_fold(cfg: dict, fold_idx: int) -> Path:
+# ==============================================================================
+# KELAS UTAMA: YOLOTrainer
+# ==============================================================================
+
+class YOLOTrainer:
     """
-    Menjalankan DroneWasteDataset.prepare() untuk fold tertentu.
-    Mengembalikan path ke dataset.yaml Ultralytics.
+    Kelas untuk fine-tuning model YOLO instance segmentation
+    pada dataset DroneWaste yang sudah dipreprocess.
+
+    Alur kerja:
+        trainer = YOLOTrainer(config_path="configs/cv.yaml", root_dir=ROOT_DIR)
+        trainer.validate_dataset()
+        trainer.train()
+        trainer.export_summary()
+
+    Contoh penggunaan langsung:
+        trainer = YOLOTrainer("configs/cv.yaml", Path("."))
+        trainer.validate_dataset()
+        trainer.train()
     """
-    coco_json    = ROOT / cfg["data"]["coco_json"]
-    images_dir   = ROOT / cfg["data"]["images_dir"]
-    processed_dir = ROOT / cfg["data"]["processed_dir"]
-    grid_size    = tuple(cfg["data"]["grid_size"])
-    n_folds      = cfg["cross_validation"]["n_folds"]
-    seed         = cfg["cross_validation"]["seed"]
 
-    ds = DroneWasteDataset(
-        coco_json=coco_json,
-        images_dir=images_dir,
-        output_dir=processed_dir,
-        seed=seed,
-    )
+    def __init__(
+        self,
+        config_path: str,
+        root_dir: Path,
+        override_epochs:  Optional[int]   = None,
+        override_batch:   Optional[int]   = None,
+        override_device:  Optional[str]   = None,
+        override_workers: Optional[int]   = None,
+    ):
+        """
+        Parameters
+        ----------
+        config_path      : Path ke configs/cv.yaml
+        root_dir         : Path root project (untuk resolve path relatif)
+        override_epochs  : Override jumlah epoch dari cv.yaml (opsional)
+        override_batch   : Override batch size dari cv.yaml (opsional)
+        override_device  : Override device dari cv.yaml, misal "cpu" / "0" / "0,1"
+        override_workers : Override jumlah DataLoader workers
+        """
+        self.config_path = Path(config_path)
+        self.root_dir    = Path(root_dir)
 
-    paths = ds.prepare(
-        grid_size=grid_size,
-        n_folds=n_folds,
-        fold_idx=fold_idx,
-        copy_images=False,      # symlink lebih cepat; fallback ke copy di Windows
-    )
+        # Override dari CLI (lebih prioritas dari cv.yaml)
+        self.override_epochs  = override_epochs
+        self.override_batch   = override_batch
+        self.override_device  = override_device
+        self.override_workers = override_workers
 
-    return paths["yaml_path"]
+        # Load konfigurasi
+        self.config = self._load_config()
 
+        # Ekstrak parameter training dari config
+        self.train_cfg   = self.config.get("training", {})
+        self.dataset_cfg = self.config
 
-def train_fold(cfg: dict, fold_idx: int, dataset_yaml: Path) -> Path:
-    """
-    Melatih YOLOv8x untuk satu fold.
-    Mengembalikan path ke best.pt.
-    """
-    # Import Ultralytics di sini agar error muncul lebih jelas jika belum terinstall
-    try:
-        from ultralytics import YOLO
-    except ImportError:
-        raise ImportError(
-            "Ultralytics belum terinstall. Jalankan:\n"
-            "  pip install ultralytics"
+        # Path-path penting
+        self.dataset_path = self.root_dir / self.config.get("path", "data/vision")
+        self.model_name   = self.train_cfg.get("model", "yolo11n.pt")
+        self.model_path   = self.root_dir / self.model_name
+        self.output_dir   = self.root_dir / self.train_cfg.get(
+            "project", "models/nn_weights"
+        )
+        self.run_name     = self.train_cfg.get("name", "aerosweep_trained")
+
+        # Path model terbaik hasil training
+        self.best_model_path = (
+            self.output_dir / self.run_name / "weights" / "best.pt"
         )
 
-    t_cfg  = cfg["train"]
-    m_cfg  = cfg["model"]
-    o_cfg  = cfg["output"]
+        # Resolusi parameter final (override > config)
+        self.epochs  = self.override_epochs  or self.train_cfg.get("epochs",  100)
+        self.batch   = self.override_batch   or self.train_cfg.get("batch",    16)
+        self.device  = self.override_device  or self.train_cfg.get("device",    0)
+        self.workers = self.override_workers or self.train_cfg.get("workers",   8)
+        self.imgsz   = self.train_cfg.get("imgsz",         512)
+        self.lr0     = self.train_cfg.get("lr0",          0.01)
+        self.lrf     = self.train_cfg.get("lrf",          0.01)
+        self.momentum     = self.train_cfg.get("momentum",    0.937)
+        self.weight_decay = self.train_cfg.get("weight_decay", 0.0005)
+        self.patience     = self.train_cfg.get("patience",       20)
+        self.augment      = self.train_cfg.get("augment",       True)
+        self.seed         = self.train_cfg.get("seed",           42)
+        self.verbose      = self.train_cfg.get("verbose",       True)
 
-    # Nama eksperimen: fold_0, fold_1, dst.
-    experiment = o_cfg["experiment_name"].replace("{fold_idx}", str(fold_idx))
+        logger.info(
+            f"YOLOTrainer diinisialisasi: model={self.model_name}, "
+            f"epochs={self.epochs}, batch={self.batch}, device={self.device}"
+        )
 
-    runs_dir = ROOT / o_cfg["runs_dir"]
-    runs_dir.mkdir(parents=True, exist_ok=True)
+    # --------------------------------------------------------------------------
+    # PRIVATE: Load konfigurasi
+    # --------------------------------------------------------------------------
 
-    print(f"\n{'='*60}")
-    print(f"  Mulai training — Fold {fold_idx}/{cfg['cross_validation']['n_folds'] - 1}")
-    print(f"  Model      : {m_cfg['pretrained_weights']}")
-    print(f"  Dataset    : {dataset_yaml}")
-    print(f"  Epochs     : {t_cfg['epochs']}  |  Batch : {t_cfg['batch']}")
-    print(f"  Output     : {runs_dir / o_cfg['project'] / experiment}")
-    print(f"{'='*60}\n")
+    def _load_config(self) -> dict:
+        """Baca cv.yaml dan kembalikan sebagai dictionary."""
+        if not self.config_path.exists():
+            raise FileNotFoundError(
+                f"File konfigurasi tidak ditemukan: {self.config_path}"
+            )
+        with open(self.config_path, "r", encoding="utf-8") as f:
+            config = yaml.safe_load(f)
+        logger.info(f"Konfigurasi dimuat dari: {self.config_path}")
+        return config
 
-    model = YOLO(m_cfg["pretrained_weights"])
+    # --------------------------------------------------------------------------
+    # PUBLIC: Validasi dataset sebelum training
+    # --------------------------------------------------------------------------
 
-    results = model.train(
-        data        = str(dataset_yaml),
-        epochs      = t_cfg["epochs"],
-        imgsz       = cfg["data"]["imgsz"],
-        batch       = t_cfg["batch"],
-        workers     = t_cfg["workers"],
-        device      = t_cfg["device"],
+    def validate_dataset(self) -> bool:
+        """
+        Validasi dataset hasil preprocessing sudah siap untuk training.
 
-        # Optimizer & LR
-        optimizer   = t_cfg["optimizer"],
-        lr0         = t_cfg["lr0"],
-        lrf         = t_cfg["lrf"],
-        momentum    = t_cfg["momentum"],
-        weight_decay= t_cfg["weight_decay"],
+        Pengecekan:
+        1. Folder train/images dan train/labels ada dan tidak kosong
+        2. Folder val/images dan val/labels ada dan tidak kosong
+        3. cv.yaml sudah memiliki nama kelas (bukan placeholder)
+        4. Model pretrained tersedia di root project
+        5. Jumlah file gambar dan label seimbang (tidak ada yang hilang)
 
-        # Warmup
-        warmup_epochs   = t_cfg["warmup_epochs"],
-        warmup_momentum = t_cfg["warmup_momentum"],
-        warmup_bias_lr  = t_cfg["warmup_bias_lr"],
+        Returns
+        -------
+        True jika semua validasi lulus.
 
-        # Early stopping
-        patience    = t_cfg["patience"],
+        Raises
+        ------
+        SystemExit jika ada validasi yang gagal.
+        """
+        logger.info("Memvalidasi dataset sebelum training...")
+        errors   = []
+        warnings = []
 
-        # Augmentasi
-        hsv_h       = t_cfg["hsv_h"],
-        hsv_s       = t_cfg["hsv_s"],
-        hsv_v       = t_cfg["hsv_v"],
-        degrees     = t_cfg["degrees"],
-        translate   = t_cfg["translate"],
-        scale       = t_cfg["scale"],
-        shear       = t_cfg["shear"],
-        perspective = t_cfg["perspective"],
-        flipud      = t_cfg["flipud"],
-        fliplr      = t_cfg["fliplr"],
-        mosaic      = t_cfg["mosaic"],
-        mixup       = t_cfg["mixup"],
-        copy_paste  = t_cfg["copy_paste"],
-        close_mosaic= t_cfg["close_mosaic"],
+        processed_dir = self.dataset_path / "processed"
 
-        # Output & logging
-        project     = str(runs_dir / o_cfg["project"]),
-        name        = experiment,
-        exist_ok    = t_cfg["exist_ok"],
-        plots       = t_cfg["plots"],
-        cache       = t_cfg["cache"],
-    )
+        # --- Cek folder train ---
+        train_img_dir = processed_dir / "train" / "images"
+        train_lbl_dir = processed_dir / "train" / "labels"
 
-    # Path ke best weights
-    best_pt = Path(results.save_dir) / "weights" / "best.pt"
+        if not train_img_dir.exists():
+            errors.append(
+                f"Folder train/images tidak ditemukan: {train_img_dir}\n"
+                f"  → Jalankan scripts/01_preprocessing.py terlebih dahulu."
+            )
+        else:
+            train_imgs = list(train_img_dir.glob("*.jpg"))
+            if not train_imgs:
+                errors.append(
+                    f"Folder train/images kosong: {train_img_dir}\n"
+                    f"  → Jalankan scripts/01_preprocessing.py terlebih dahulu."
+                )
+            else:
+                logger.info(f"  Train images  : {len(train_imgs)} file ✓")
 
-    # Salin juga ke folder nn_weights/ untuk akses mudah
-    weights_dir = ROOT / o_cfg["weights_dir"]
-    weights_dir.mkdir(parents=True, exist_ok=True)
-    dest = weights_dir / f"fold_{fold_idx}_best.pt"
-    if best_pt.exists():
-        import shutil
-        shutil.copy2(best_pt, dest)
-        print(f"\n[train] Best weights disalin ke: {dest}")
+        if not train_lbl_dir.exists():
+            errors.append(f"Folder train/labels tidak ditemukan: {train_lbl_dir}")
+        else:
+            train_lbls = list(train_lbl_dir.glob("*.txt"))
+            logger.info(f"  Train labels  : {len(train_lbls)} file ✓")
 
-    return best_pt
+        # --- Cek folder val ---
+        val_img_dir = processed_dir / "val" / "images"
+        val_lbl_dir = processed_dir / "val" / "labels"
 
+        if not val_img_dir.exists():
+            errors.append(
+                f"Folder val/images tidak ditemukan: {val_img_dir}\n"
+                f"  → Jalankan scripts/01_preprocessing.py terlebih dahulu."
+            )
+        else:
+            val_imgs = list(val_img_dir.glob("*.jpg"))
+            if not val_imgs:
+                errors.append(f"Folder val/images kosong: {val_img_dir}")
+            else:
+                logger.info(f"  Val images    : {len(val_imgs)} file ✓")
 
-def run_training(cfg: dict, fold_idx: int) -> None:
-    """Prepare dataset + train untuk satu fold."""
-    start = time.time()
+        if not val_lbl_dir.exists():
+            errors.append(f"Folder val/labels tidak ditemukan: {val_lbl_dir}")
+        else:
+            val_lbls = list(val_lbl_dir.glob("*.txt"))
+            logger.info(f"  Val labels    : {len(val_lbls)} file ✓")
 
-    print(f"\n[train] Menyiapkan dataset untuk fold {fold_idx} ...")
-    dataset_yaml = prepare_fold(cfg, fold_idx)
+        # --- Cek cv.yaml sudah diupdate (bukan placeholder) ---
+        nc    = self.config.get("nc", 0)
+        names = self.config.get("names", {})
 
-    best_pt = train_fold(cfg, fold_idx, dataset_yaml)
+        if nc == 0 or not names:
+            errors.append(
+                "cv.yaml belum diupdate dengan nama kelas.\n"
+                "  → Jalankan scripts/01_preprocessing.py terlebih dahulu\n"
+                "    agar bagian 'nc' dan 'names' terisi dari JSON."
+            )
+        else:
+            logger.info(f"  Jumlah kelas  : {nc} ✓")
+            logger.info(f"  Nama kelas    : {list(names.values())[:3]}... ✓")
 
-    elapsed = time.time() - start
-    h, m = divmod(int(elapsed), 3600)
-    m, s = divmod(m, 60)
+        # --- Cek model pretrained tersedia ---
+        if not self.model_path.exists():
+            errors.append(
+                f"Model pretrained tidak ditemukan: {self.model_path}\n"
+                f"  → Pastikan {self.model_name} ada di root project.\n"
+                f"    Ultralytics akan otomatis download jika ada koneksi internet."
+            )
+        else:
+            logger.info(f"  Model pretrained: {self.model_path} ✓")
 
-    print(f"\n{'='*60}")
-    print(f"  Training fold {fold_idx} selesai dalam {h}j {m}m {s}d")
-    print(f"  Best weights : {best_pt}")
-    print(f"{'='*60}\n")
+        # --- Cek keseimbangan file gambar dan label ---
+        if train_img_dir.exists() and train_lbl_dir.exists():
+            train_imgs_stem = {f.stem for f in train_img_dir.glob("*.jpg")}
+            train_lbls_stem = {f.stem for f in train_lbl_dir.glob("*.txt")}
+            missing_labels  = train_imgs_stem - train_lbls_stem
 
+            if missing_labels:
+                warnings.append(
+                    f"{len(missing_labels)} file gambar train tidak memiliki "
+                    f"file label yang sesuai. Contoh: "
+                    f"{list(missing_labels)[:3]}"
+                )
 
-# ---------------------------------------------------------------------------
-# ENTRY POINT
-# ---------------------------------------------------------------------------
+        # --- Tampilkan hasil validasi ---
+        if warnings:
+            for w in warnings:
+                logger.warning(f"  ⚠ {w}")
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="AeroSweep — Training YOLOv8x dengan K-Fold CV"
-    )
-    parser.add_argument(
-        "--config",
-        default="configs/cv.yaml",
-        help="Path ke file konfigurasi (default: configs/cv.yaml)",
-    )
-    parser.add_argument(
-        "--fold",
-        type=int,
-        default=None,
-        help="Index fold yang akan dilatih (0-based). "
-             "Jika tidak diisi, pakai fold_idx dari config.",
-    )
-    parser.add_argument(
-        "--all_folds",
-        action="store_true",
-        help="Latih semua fold secara berurutan.",
-    )
-    args = parser.parse_args()
+        if errors:
+            logger.error("Validasi dataset GAGAL:")
+            for e in errors:
+                logger.error(f"  ✗ {e}")
+            sys.exit(1)
 
-    # Load config
-    config_path = ROOT / args.config
-    if not config_path.exists():
-        raise FileNotFoundError(f"Config tidak ditemukan: {config_path}")
-    cfg = load_config(config_path)
+        logger.info("Validasi dataset: PASSED ✓")
+        return True
 
-    n_folds = cfg["cross_validation"]["n_folds"]
+    # --------------------------------------------------------------------------
+    # PUBLIC: Training utama
+    # --------------------------------------------------------------------------
 
-    if args.all_folds:
-        print(f"[train] Mode: semua {n_folds} fold")
-        for fold_idx in range(n_folds):
-            run_training(cfg, fold_idx)
-    else:
-        fold_idx = args.fold if args.fold is not None else cfg["cross_validation"]["fold_idx"]
-        if not (0 <= fold_idx < n_folds):
-            raise ValueError(f"fold_idx harus antara 0 dan {n_folds - 1}, dapat: {fold_idx}")
-        run_training(cfg, fold_idx)
+    def train(self) -> dict:
+        """
+        Jalankan fine-tuning YOLO instance segmentation.
 
+        Menggunakan Ultralytics YOLO API yang sudah diuji dan
+        terdokumentasi di https://docs.ultralytics.com/modes/train/
 
-if __name__ == "__main__":
-    main()
+        Proses:
+        1. Load model pretrained yolo11n.pt
+        2. Fine-tune pada dataset DroneWaste
+        3. Simpan best.pt ke models/nn_weights/aerosweep_trained/weights/
+        4. Update path model di cv.yaml untuk digunakan inferensi
+
+        Returns
+        -------
+        Dictionary berisi ringkasan hasil training (metrics).
+        """
+        logger.info("=" * 60)
+        logger.info("Memulai fine-tuning YOLO Instance Segmentation")
+        logger.info("=" * 60)
+        self._print_training_plan()
+
+        # Buat direktori output
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        # ------------------------------------------------------------------
+        # Load model pretrained
+        # ------------------------------------------------------------------
+        logger.info(f"Memuat model: {self.model_path}")
+        try:
+            model = YOLO(str(self.model_path))
+        except Exception as e:
+            logger.error(f"Gagal memuat model: {e}")
+            raise
+        if getattr(model, "task", None) != "segment":
+            raise ValueError(
+                "Model bukan instance segmentation (task != 'segment'). "
+                "Gunakan bobot *-seg.pt atau model segmentation."
+            )
+
+        # ------------------------------------------------------------------
+        # Mulai training
+        # Semua parameter didokumentasikan di:
+        # https://docs.ultralytics.com/modes/train/#train-settings
+        # ------------------------------------------------------------------
+        start_time = time.time()
+
+        try:
+            results = model.train(
+                # --- Dataset ---
+                data        = str(self.config_path),
+                imgsz       = self.imgsz,
+
+                # --- Training schedule ---
+                epochs      = self.epochs,
+                batch       = self.batch,
+                patience    = self.patience,
+
+                # --- Optimizer ---
+                lr0          = self.lr0,
+                lrf          = self.lrf,
+                momentum     = self.momentum,
+                weight_decay = self.weight_decay,
+
+                # --- Augmentasi ---
+                augment     = self.augment,
+
+                # --- Hardware ---
+                device      = self.device,
+                workers     = self.workers,
+
+                # --- Output ---
+                project     = str(self.output_dir),
+                name        = self.run_name,
+                exist_ok    = True,    # Overwrite run sebelumnya
+
+                # --- Reproduktibilitas ---
+                seed        = self.seed,
+
+                # --- Logging ---
+                verbose     = self.verbose,
+
+                # --- Simpan model ---
+                # save=True      : simpan best.pt dan last.pt
+                # save_period=-1 : tidak simpan checkpoint per epoch
+                save        = True,
+                save_period = self.train_cfg.get("save_period", -1),
+
+                # --- Pretrained ---
+                # True = gunakan bobot pretrained (fine-tuning)
+                # False = training dari scratch
+                pretrained  = True,
+            )
+
+        except KeyboardInterrupt:
+            logger.warning("Training dihentikan oleh pengguna (Ctrl+C).")
+            logger.warning(
+                "Model terakhir tersimpan di: "
+                f"{self.output_dir / self.run_name / 'weights' / 'last.pt'}"
+            )
+            raise
+
+        except Exception as e:
+            logger.error(f"Error selama training: {e}")
+            raise
+
+        elapsed = time.time() - start_time
+        logger.info(f"Training selesai dalam {elapsed / 60:.1f} menit ✓")
+
+        # ------------------------------------------------------------------
+        # Salin best.pt ke lokasi yang dikonfigurasi di cv.yaml
+        # ------------------------------------------------------------------
+        self._sync_best_model()
+
+        # ------------------------------------------------------------------
+        # Update path model di cv.yaml untuk inferensi
+        # ------------------------------------------------------------------
+        self._update_inference_model_path()
+
+        # ------------------------------------------------------------------
+        # Ringkasan metrics
+        # ------------------------------------------------------------------
+        summary = self._extract_metrics(results, elapsed)
+        return summary
+
+    # --------------------------------------------------------------------------
+    # PRIVATE: Sync best model ke path inferensi
+    # --------------------------------------------------------------------------
+
+    def _sync_best_model(self):
+        """
+        Pastikan best.pt tersimpan di lokasi yang benar sesuai cv.yaml.
+        Ultralytics menyimpan di: output_dir/run_name/weights/best.pt
+        """
+        best_src = self.output_dir / self.run_name / "weights" / "best.pt"
+
+        if best_src.exists():
+            logger.info(f"Model terbaik tersimpan di: {best_src} ✓")
+            # Juga simpan salinan dengan nama yang lebih deskriptif
+            best_copy = self.output_dir / "aerosweep_best.pt"
+            shutil.copy2(best_src, best_copy)
+            logger.info(f"Salinan model disimpan di: {best_copy} ✓")
+        else:
+            logger.warning(
+                f"best.pt tidak ditemukan di: {best_src}\n"
+                f"  Cek folder {self.output_dir / self.run_name / 'weights'}"
+            )
+
+    def _update_inference_model_path(self):
+        """
+        Update bagian inference.model_path di cv.yaml
+        agar scripts/03_inference_extraction.py otomatis
+        menggunakan model terbaik hasil training ini.
+        """
+        best_model = self.output_dir / self.run_name / "weights" / "best.pt"
+
+        if not best_model.exists():
+            logger.warning("Tidak dapat update cv.yaml: best.pt tidak ditemukan.")
+            return
+
+        with open(self.config_path, "r", encoding="utf-8") as f:
+            config = yaml.safe_load(f)
+
+        # Update path model inferensi
+        # Simpan sebagai path relatif dari root project
+        relative_path = str(best_model.relative_to(self.root_dir))
+        config.setdefault("inference", {})["model_path"] = relative_path
+
+        with open(self.config_path, "w", encoding="utf-8") as f:
+            yaml.dump(
+                config,
+                f,
+                default_flow_style=False,
+                allow_unicode=True,
+                sort_keys=False,
+            )
+
+        logger.info(
+            f"cv.yaml diperbarui: inference.model_path = {relative_path} ✓"
+        )
+
+    # --------------------------------------------------------------------------
+    # PRIVATE: Ekstrak dan tampilkan metrics
+    # --------------------------------------------------------------------------
+
+    def _extract_metrics(self, results, elapsed: float) -> dict:
+        """
+        Ekstrak metrics utama dari hasil training Ultralytics.
+
+        Ultralytics results object memiliki atribut:
+        - results.results_dict : dictionary semua metrics
+        - results.maps         : mAP per kelas
+
+        Parameters
+        ----------
+        results : Objek hasil model.train() dari Ultralytics
+        elapsed : Waktu training dalam detik
+
+        Returns
+        -------
+        Dictionary ringkasan metrics.
+        """
+        summary = {
+            "elapsed_seconds" : elapsed,
+            "elapsed_minutes" : round(elapsed / 60, 1),
+            "model"           : self.model_name,
+            "epochs"          : self.epochs,
+            "imgsz"           : self.imgsz,
+            "best_model_path" : str(
+                self.output_dir / self.run_name / "weights" / "best.pt"
+            ),
+        }
+
+        # Ekstrak metrics dari results jika tersedia
+        try:
+            if hasattr(results, "results_dict") and results.results_dict:
+                rd = results.results_dict
+                summary.update({
+                    # Metrics segmentasi instance
+                    "metrics/mAP50(M)"    : rd.get("metrics/mAP50(M)",    "N/A"),
+                    "metrics/mAP50-95(M)" : rd.get("metrics/mAP50-95(M)", "N/A"),
+                    "metrics/precision(M)": rd.get("metrics/precision(M)","N/A"),
+                    "metrics/recall(M)"   : rd.get("metrics/recall(M)",   "N/A"),
+                    # Loss akhir
+                    "train/box_loss"      : rd.get("train/box_loss",      "N/A"),
+                    "train/seg_loss"      : rd.get("train/seg_loss",      "N/A"),
+                    "train/cls_loss"      : rd.get("train/cls_loss",      "N/A"),
+                })
+        except Exception as e:
+            logger.warning(f"Tidak dapat mengekstrak metrics detail: {e}")
+
+        return summary
+
+    def _print_training_plan(self):
+        """Tampilkan parameter training sebelum dimulai."""
+        logger.info("Parameter training:")
+        logger.info(f"  Model pretrained : {self.model_path}")
+        logger.info(f"  Dataset config   : {self.config_path}")
+        logger.info(f"  Epochs           : {self.epochs}")
+        logger.info(f"  Batch size       : {self.batch}")
+        logger.info(f"  Image size       : {self.imgsz}x{self.imgsz}")
+        logger.info(f"  Learning rate    : {self.lr0} → {self.lr0 * self.lrf:.6f}")
+        logger.info(f"  Early stopping   : patience={self.patience} epoch")
+        logger.info(f"  Device           : {self.device}")
+        logger.info(f"  Workers          : {self.workers}")
+        logger.info(f"  Output dir       : {self.output_dir / self.run_name}")
+        logger.info(f"  Augmentasi       : {self.augment}")
+        logger.info(f"  Seed             : {self.seed}")
+
+    # --------------------------------------------------------------------------
+    # PUBLIC: Export ringkasan training ke file teks
+    # --------------------------------------------------------------------------
+
+    def export_summary(self, summary: dict):
+        """
+        Simpan ringkasan hasil training ke outputs/training_summary.txt
+        untuk dokumentasi dan referensi tim.
+
+        Parameters
+        ----------
+        summary : Dictionary hasil dari _extract_metrics()
+        """
+        summary_path = self.root_dir / "outputs" / "training_summary.txt"
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with open(summary_path, "w", encoding="utf-8") as f:
+            f.write("=" * 60 + "\n")
+            f.write("AeroSweep — Ringkasan Hasil Training\n")
+            f.write("=" * 60 + "\n\n")
+
+            for key, value in summary.items():
+                f.write(f"  {key:<30}: {value}\n")
+
+            f.write("\n" + "=" * 60 + "\n")
+            f.write("Langkah berikutnya:\n")
+            f.write("  python scripts/03_inference_extraction.py\n")
+            f.write("=" * 60 + "\n")
+
+        logger.info(f"Ringkasan training disimpan di: {summary_path} ✓")
