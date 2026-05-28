@@ -40,6 +40,7 @@ models/fuzzy_params/
 
 # File CSV output (tim Fuzzy ambil dari pipeline, bukan dari Git)
 outputs/output_fitur_ann_ke_fuzzy.csv
+outputs/output_fuzzy_results.csv
 outputs/annotated_grids/
 
 # File gambar visualisasi (di-generate ulang dari notebook)

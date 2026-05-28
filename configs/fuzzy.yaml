@@ -1,6 +1,60 @@
-# Fuzzy + GA config (placeholder)
-fitness:
-  metric: "f1"
+input_csv: outputs/output_fitur_ann_ke_fuzzy.csv
+output_csv: outputs/output_fuzzy_results.csv
+
+processing:
+  filter_has_detection: true
+
+variables:
+  area_density_pct:
+    low: [0, 0, 5, 15]
+    medium: [10, 25, 40]
+    high: [30, 60, 100, 100]
+  jumlah_instance:
+    few: [0, 0, 2, 5]
+    medium: [3, 10, 20]
+    many: [15, 35, 100, 100]
+  confidence_score:
+    low: [0.0, 0.0, 0.30, 0.50]
+    medium: [0.35, 0.60, 0.80]
+    high: [0.70, 0.90, 1.0, 1.0]
+
+category_weights:
+  none: 0.00
+  Rubble: 0.80
+  Construction and demolition materials: 0.85
+  Asphalt milling: 0.75
+  Excavation materials: 0.70
+  Appliances: 0.65
+  Electronic equipment: 0.70
+  Furniture: 0.60
+  Metal barrels: 0.75
+  Plastic packaging: 0.55
+  Wood: 0.50
+  Pallets: 0.55
+  Scrap: 0.75
+  Plastic: 0.55
+  Vehicles: 0.80
+  Tyres: 0.65
+  Paper: 0.45
+  Foundry: 0.85
+  Asbestos: 1.00
+  Textile: 0.45
+  Mixed items: 0.70
+
+risk_output:
+  centers:
+    low: 20
+    medium: 50
+    high: 75
+    critical: 95
+  levels:
+    low: [0, 40]
+    medium: [40, 65]
+    high: [65, 85]
+    critical: [85, 100]
+
 ga:
+  enabled: false
   population_size: 50
   generations: 40
+  fitness_metric: f1
