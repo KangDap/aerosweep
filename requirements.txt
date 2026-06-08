@@ -81,3 +81,13 @@ ipykernel>=6.29.0
 
 # Uncomment jika tim menggunakan Weights & Biases untuk experiment tracking
 # wandb>=0.16.0
+
+# ------------------------------------------------------------------------------
+# 7. GA-FUZZY DASHBOARD — Streamlit UI & visualisasi interaktif
+# ------------------------------------------------------------------------------
+
+# Dashboard web interaktif
+streamlit>=1.30.0
+
+# Grafik interaktif (membership functions, fitness curves, comparisons)
+plotly>=5.18.0
