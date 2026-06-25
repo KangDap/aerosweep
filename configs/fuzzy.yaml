@@ -54,7 +54,14 @@ risk_output:
     critical: [85, 100]
 
 ga:
-  enabled: false
+  enabled: true
   population_size: 50
   generations: 40
-  fitness_metric: f1
+  mutation_rate: 0.1
+  crossover_rate: 0.8
+  tournament_size: 3
+  elitism_count: 2
+  blx_alpha: 0.5
+  mutation_sigma: 0.1
+  fitness_metric: mae
+  random_seed: 42

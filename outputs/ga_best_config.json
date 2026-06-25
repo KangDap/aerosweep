@@ -1,0 +1,110 @@
+{
+  "variables": {
+    "area_density_pct": {
+      "low": [
+        0,
+        0,
+        4.966796968714578,
+        27.632127748630452
+      ],
+      "medium": [
+        31.57404616016305,
+        46.526317990397715,
+        53.79165108712945
+      ],
+      "high": [
+        22.102644084819843,
+        47.57818199596065,
+        100,
+        100
+      ]
+    },
+    "jumlah_instance": {
+      "few": [
+        0,
+        0,
+        23.781485208550368,
+        31.218613756196955
+      ],
+      "medium": [
+        0.0,
+        43.459168192762064,
+        45.064889044623364
+      ],
+      "many": [
+        6.5240089245722,
+        52.14443257752636,
+        100,
+        100
+      ]
+    },
+    "confidence_score": {
+      "low": [
+        0.0,
+        0.0,
+        1.0,
+        1.0
+      ],
+      "medium": [
+        0.12579619113760357,
+        0.6137625911185807,
+        0.6645689991089682
+      ],
+      "high": [
+        0.608426087375548,
+        0.8079747275283182,
+        1.0,
+        1.0
+      ]
+    }
+  },
+  "category_weights": {
+    "none": 0.0,
+    "Rubble": 0.8,
+    "Construction and demolition materials": 0.85,
+    "Asphalt milling": 0.75,
+    "Excavation materials": 0.7,
+    "Appliances": 0.65,
+    "Electronic equipment": 0.7,
+    "Furniture": 0.6,
+    "Metal barrels": 0.75,
+    "Plastic packaging": 0.55,
+    "Wood": 0.5,
+    "Pallets": 0.55,
+    "Scrap": 0.75,
+    "Plastic": 0.55,
+    "Vehicles": 0.8,
+    "Tyres": 0.65,
+    "Paper": 0.45,
+    "Foundry": 0.85,
+    "Asbestos": 1.0,
+    "Textile": 0.45,
+    "Mixed items": 0.7
+  },
+  "risk_output": {
+    "centers": {
+      "low": 19.162820599852637,
+      "medium": 22.724310560705565,
+      "high": 90.76872183078628,
+      "critical": 100.0
+    },
+    "levels": {
+      "low": [
+        0,
+        40
+      ],
+      "medium": [
+        40,
+        65
+      ],
+      "high": [
+        65,
+        85
+      ],
+      "critical": [
+        85,
+        100
+      ]
+    }
+  }
+}
