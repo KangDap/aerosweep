@@ -23,15 +23,10 @@ data/vision/test_grids/
 # ------------------------------------------------------------------------------
 
 # Semua file bobot model
-*.pt
 *.pth
 *.onnx
 *.engine
 *.tflite
-
-# Folder hasil training Ultralytics
-models/nn_weights/
-models/fuzzy_params/
 
 
 # ------------------------------------------------------------------------------

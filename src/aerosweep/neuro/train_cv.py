@@ -254,7 +254,7 @@ class YOLOTrainer:
         # --- Tampilkan hasil validasi ---
         if warnings:
             for w in warnings:
-                logger.warning(f"  ⚠ {w}")
+                logger.warning(f"   {w}")
 
         if errors:
             logger.error("Validasi dataset GAGAL:")

@@ -19,7 +19,7 @@ from aerosweep.fuzzy_ga.ga_optimizer import optimize_fuzzy, evaluate_metrics
 # --- PAGE CONFIG ---
 st.set_page_config(
     page_title="AeroSweep Hybrid GA-Fuzzy",
-    page_icon="🚁",
+    page_icon="",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -71,7 +71,7 @@ st.markdown("""
 
 
 @st.cache_data
-def load_data(path: str) -> pd.DataFrame:
+def load_data(path: str, cache_key: str = "") -> pd.DataFrame:
     try:
         df = pd.read_csv(path)
         return df
@@ -131,23 +131,226 @@ def plot_risk_distribution(df_res: pd.DataFrame, title: str):
 
 
 def main() -> None:
-    st.title("🚁 AeroSweep Hybrid GA-Fuzzy Optimizer")
+    st.title(" AeroSweep Hybrid GA-Fuzzy Optimizer")
     st.markdown("Optimize Fuzzy Logic parameters using Genetic Algorithm to improve risk assessment accuracy based on expert ground truth.")
 
-    data_path = "outputs/output_fitur_ann_ke_fuzzy.csv"
-    df = load_data(data_path)
+    # --- SIDEBAR: INPUT HASIL ANN & PANDUAN ---
+    st.sidebar.header(" Input Hasil ANN")
+    st.sidebar.markdown("""
+    Unggah file CSV hasil ekstraksi fitur dari pipeline Artificial Neural Network (ANN) Anda untuk dianalisis dan dioptimasi menggunakan logika Fuzzy & GA.
+    """)
+    
+    uploaded_file = st.sidebar.file_uploader("Pilih file CSV Hasil ANN", type=["csv"])
+    cache_key = ""
+    
+    custom_data_path = Path("outputs/uploaded_fitur_ann_ke_fuzzy.csv")
+    
+    if uploaded_file is not None:
+        save_dir = Path("outputs")
+        save_dir.mkdir(exist_ok=True)
+        with open(custom_data_path, "wb") as f:
+            f.write(uploaded_file.getbuffer())
+        data_path = str(custom_data_path)
+        cache_key = f"{uploaded_file.name}_{uploaded_file.size}"
+        st.sidebar.success(f"File `{uploaded_file.name}` berhasil diunggah dan aktif!")
+    elif custom_data_path.exists():
+        data_path = str(custom_data_path)
+        import os
+        cache_key = f"custom_{os.path.getmtime(custom_data_path)}"
+        st.sidebar.success("️ Menggunakan data CSV kustom / hasil penambahan dari inferensi ANN.")
+        if st.sidebar.button(" Reset ke Data Default"):
+            custom_data_path.unlink(missing_ok=True)
+            st.rerun()
+    else:
+        data_path = "outputs/output_fitur_ann_ke_fuzzy.csv"
+        st.sidebar.info("Menggunakan data default (`outputs/output_fitur_ann_ke_fuzzy.csv`).")
+
+    st.sidebar.markdown("---")
+    st.sidebar.header(" Panduan Penggunaan & Format Input")
+    with st.sidebar.expander("Lihat Panduan Format CSV ANN", expanded=False):
+        st.markdown("""
+        **Format Kolom CSV yang Dibutuhkan:**
+        File CSV hasil ANN harus memiliki kolom-kolom berikut agar kompatibel dengan evaluasi Fuzzy & GA:
+        
+        1. `grid_id`: Identifier unik untuk setiap grid/region (contoh: `grid_0_0`).
+        2. `has_detection`: Flag integer (`1` jika ada deteksi anomali/objek, `0` jika tidak ada).
+        3. `area_density_pct`: Persentase kepadatan area deteksi (rentang `0.0` - `100.0`).
+        4. `jumlah_instance`: Jumlah instans/objek yang terdeteksi (integer, `0` - `100`).
+        5. `confidence_score`: Nilai kepercayaan dari prediksi ANN (rentang `0.0` - `1.0`).
+        6. `kategori_dominan`: Kategori objek dominan (contoh: `Asbestos`, `Hazardous`, `Vehicles`, `none`).
+
+        **Alur Kerja (Workflow):**
+        1. **Tab ANN Inference (CV)**: Unggah citra UAV untuk menjalankan segmentasi instans YOLO dan otomatis mengekstrak fitur ke tabel Fuzzy.
+        2. **Input Data**: Atau unggah file CSV Anda pada uploader di atas.
+        3. **Tab Data Overview**: Periksa apakah data hasil ANN berhasil dimuat dengan benar.
+        4. **Tab Default Fuzzy**: Lihat hasil perhitungan skor risiko (risk level) menggunakan aturan fuzzy bawaan.
+        5. **Tab GA Optimization**: Jalankan Algoritma Genetika (GA) untuk mengoptimalkan parameter keanggotaan (membership function) fuzzy agar sesuai dengan *ground truth* pakar.
+        6. **Tab Comparison**: Bandingkan performa (MSE & MAE) antara Fuzzy Default vs GA-Optimized.
+        """)
+
+    df = load_data(data_path, cache_key=cache_key)
 
     if df.empty:
         st.warning(f"Could not load data from `{data_path}`. Ensure the file exists.")
         return
 
     # Tabs
-    tab1, tab2, tab3, tab4 = st.tabs([
-        "📊 Data Overview", 
-        "🧠 Default Fuzzy", 
-        "🧬 GA Optimization", 
-        "⚖️ Comparison"
+    tab_ann, tab1, tab2, tab3, tab4 = st.tabs([
+        "️ ANN Inference (CV)",
+        " Data Overview", 
+        " Default Fuzzy", 
+        " GA Optimization", 
+        "️ Comparison"
     ])
+
+    with tab_ann:
+        st.subheader("️ Segmen ANN: YOLO Instance Segmentation & Ekstraksi Fitur")
+        st.markdown("""
+        Jalankan model Artificial Neural Network (YOLO Instance Segmentation) secara langsung pada citra UAV/Grid. 
+        Sistem akan mendeteksi objek/sampah, menghitung kepadatan area, koordinat centroid, jumlah instans, serta kategori material dominan untuk diteruskan ke sistem Fuzzy.
+        """)
+        
+        col_model, col_img = st.columns(2)
+        
+        # --- MODEL WEIGHT SELECTION / UPLOAD ---
+        with col_model:
+            st.markdown("#### 1. Persiapan Model YOLO (`best.pt`)")
+            default_model_dir = Path("models/nn_weights/aerosweep_trained/weights")
+            default_model_path = default_model_dir / "best.pt"
+            
+            if default_model_path.exists():
+                st.success(f"️ Model terlatih terdeteksi di `{default_model_path}`")
+                active_model_path = default_model_path
+            else:
+                st.info("️ File `best.pt` belum ada di repositori. Unggah file `best.pt` Anda atau gunakan base model pre-trained.")
+                uploaded_model = st.file_uploader("Unggah file model (best.pt / .pt)", type=["pt"])
+                use_base_model = st.checkbox("Gunakan Base Model YOLO11n-seg (Otomatis unduh jika belum ada)", value=False)
+                
+                if uploaded_model is not None:
+                    default_model_dir.mkdir(parents=True, exist_ok=True)
+                    with open(default_model_path, "wb") as f:
+                        f.write(uploaded_model.getbuffer())
+                    st.success(f"️ Model `{uploaded_model.name}` berhasil diunggah!")
+                    active_model_path = default_model_path
+                elif use_base_model:
+                    with st.spinner("Mengunduh/Memuat base model yolo11n-seg.pt..."):
+                        from ultralytics import YOLO
+                        _temp_model = YOLO("yolo11n-seg.pt")
+                    active_model_path = Path("yolo11n-seg.pt")
+                    st.success("️ Base model `yolo11n-seg.pt` siap digunakan!")
+                else:
+                    active_model_path = None
+                    st.warning("️ Silakan unggah model `.pt` atau centang opsi Base Model di atas untuk melanjutkan.")
+
+            st.markdown("---")
+            st.markdown("#### Pengaturan Inferensi")
+            conf_thresh = st.slider("Confidence Threshold", min_value=0.05, max_value=1.0, value=0.25, step=0.05)
+            iou_thresh = st.slider("IoU Threshold", min_value=0.05, max_value=1.0, value=0.45, step=0.05)
+
+        # --- IMAGE UPLOAD & INFERENCE ---
+        with col_img:
+            st.markdown("#### 2. Unggah Citra UAV / Grid")
+            uploaded_image = st.file_uploader("Pilih gambar grid UAV (.jpg / .png)", type=["jpg", "jpeg", "png"])
+            
+            if uploaded_image is not None:
+                grid_dir = Path("outputs/uploaded_grids")
+                grid_dir.mkdir(parents=True, exist_ok=True)
+                img_path = grid_dir / uploaded_image.name
+                with open(img_path, "wb") as f:
+                    f.write(uploaded_image.getbuffer())
+                
+                st.image(uploaded_image, caption=f"Citra Input: {uploaded_image.name}", use_container_width=True)
+                
+                if active_model_path is not None:
+                    if st.button(" Jalankan Inferensi ANN & Ekstraksi Fitur", type="primary"):
+                        with st.spinner("Menjalankan model YOLO Instance Segmentation..."):
+                            from aerosweep.neuro.inference_cv import FeatureExtractor
+                            try:
+                                extractor = FeatureExtractor(
+                                    model_path=str(active_model_path),
+                                    config_path="configs/cv.yaml",
+                                    conf_threshold=conf_thresh,
+                                    iou_threshold=iou_thresh,
+                                    device="cpu",
+                                    save_annotated=True,
+                                    annotated_dir="outputs/annotated_grids"
+                                )
+                                row_result = extractor.process_single_grid(img_path)
+                                st.session_state["ann_result"] = row_result
+                                st.session_state["ann_img_stem"] = img_path.stem
+                                st.success("️ Inferensi berhasil!")
+                            except Exception as e:
+                                st.error(f"Terjadi kesalahan saat inferensi: {e}")
+                else:
+                    st.error("️ Model belum siap. Selesaikan Persiapan Model di sebelah kiri.")
+
+        # --- DISPLAY RESULTS & INTEGRATE WITH FUZZY ---
+        if "ann_result" in st.session_state:
+            st.markdown("---")
+            st.markdown("###  Hasil Ekstraksi Fitur ANN (Computer Vision)")
+            res = st.session_state["ann_result"]
+            img_stem = st.session_state["ann_img_stem"]
+            
+            mc1, mc2, mc3, mc4 = st.columns(4)
+            with mc1:
+                st.markdown(f'''
+                    <div class="metric-card">
+                        <div class="metric-label">Jumlah Instance</div>
+                        <div class="metric-value">{res["jumlah_instance"]}</div>
+                    </div>
+                ''', unsafe_allow_html=True)
+            with mc2:
+                st.markdown(f'''
+                    <div class="metric-card">
+                        <div class="metric-label">Area Density (%)</div>
+                        <div class="metric-value">{res["area_density_pct"]:.2f}%</div>
+                    </div>
+                ''', unsafe_allow_html=True)
+            with mc3:
+                st.markdown(f'''
+                    <div class="metric-card">
+                        <div class="metric-label">Kategori Dominan</div>
+                        <div class="metric-value" style="font-size:1.4em;">{res["kategori_dominan"]}</div>
+                    </div>
+                ''', unsafe_allow_html=True)
+            with mc4:
+                st.markdown(f'''
+                    <div class="metric-card">
+                        <div class="metric-label">Avg Confidence</div>
+                        <div class="metric-value">{res["confidence_score"]:.2f}</div>
+                    </div>
+                ''', unsafe_allow_html=True)
+
+            st.markdown("<br>", unsafe_allow_html=True)
+            
+            col_annotated, col_action = st.columns([2, 1])
+            with col_annotated:
+                annotated_file = Path("outputs/annotated_grids") / f"{img_stem}_annotated.jpg"
+                if annotated_file.exists():
+                    st.image(str(annotated_file), caption="Hasil Deteksi YOLO (Masks, Boxes, Centroid)", use_container_width=True)
+                else:
+                    st.info("Citra teranotasi tidak ditemukan atau tidak ada deteksi.")
+                    
+            with col_action:
+                st.markdown("####  Kirim ke Pipeline Fuzzy")
+                st.markdown("Tambahkan hasil ekstraksi fitur citra ini langsung ke tabel data Fuzzy & GA untuk dianalisis tingkat risikonya.")
+                if st.button(" Masukkan ke Tabel Data Fuzzy", type="primary"):
+                    new_row_df = pd.DataFrame([res])
+                    new_row_df["has_detection"] = 1 if res["jumlah_instance"] > 0 else 0
+                    new_row_df["processed_at"] = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+                    
+                    custom_path = Path("outputs/uploaded_fitur_ann_ke_fuzzy.csv")
+                    if custom_path.exists():
+                        existing_df = pd.read_csv(custom_path)
+                        updated_df = pd.concat([existing_df, new_row_df], ignore_index=True)
+                    else:
+                        default_df = pd.read_csv("outputs/output_fitur_ann_ke_fuzzy.csv")
+                        updated_df = pd.concat([default_df, new_row_df], ignore_index=True)
+                    
+                    updated_df.to_csv(custom_path, index=False)
+                    st.session_state["last_added_grid"] = res["grid_id"]
+                    st.success("️ Berhasil ditambahkan! Silakan buka tab ** Data Overview** atau ** Default Fuzzy** untuk melihat hasilnya.")
+                    st.balloons()
 
     with tab1:
         st.subheader("Tabular Features (from ANN pipeline)")
@@ -189,7 +392,7 @@ def main() -> None:
         pop_size = col1.slider("Population Size", min_value=5, max_value=50, value=15, step=5)
         generations = col2.slider("Generations", min_value=5, max_value=50, value=10, step=5)
         
-        if st.button("🚀 Start GA Optimization", type="primary"):
+        if st.button(" Start GA Optimization", type="primary"):
             progress_bar = st.progress(0)
             status_text = st.empty()
             
@@ -211,7 +414,7 @@ def main() -> None:
                 st.balloons()
 
         if "best_config" in st.session_state:
-            st.markdown("### 🏆 Best Found Configuration")
+            st.markdown("###  Best Found Configuration")
             st.json(st.session_state["best_config"]["variables"])
 
     with tab4:
@@ -238,7 +441,7 @@ def main() -> None:
                 st.markdown("#### GA-Optimized Fuzzy")
                 mse_diff = metrics_def['MSE'] - metrics_ga['MSE']
                 mae_diff = metrics_def['MAE'] - metrics_ga['MAE']
-                st.markdown(f"**MSE:** {metrics_ga['MSE']} 🟢 (-{mse_diff:.2f}) | **MAE:** {metrics_ga['MAE']} 🟢 (-{mae_diff:.2f})")
+                st.markdown(f"**MSE:** {metrics_ga['MSE']}  (-{mse_diff:.2f}) | **MAE:** {metrics_ga['MAE']}  (-{mae_diff:.2f})")
                 plot_risk_distribution(df_ga, "Risk Distribution (GA-Optimized)")
                 
             st.info("The GA optimization adjusts the membership parameters so that the fuzzy inference aligns more closely with the expert ground truth, often shifting priority classifications to better reflect critical states.")
